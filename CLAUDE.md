@@ -10,15 +10,15 @@ Core behavior:
 - Use delegation rules for large or uncertain work.
 
 Rules:
-- .cairn/rules/core/cairn-core-persistence-layers.md
-- .cairn/rules/core/cairn-core-atlas.md
-- .cairn/rules/core/cairn-core-typed-dir-emission.md
-- .cairn/rules/core/cairn-core-agent-delegation.md
-- .cairn/rules/core/cairn-core-atlas-marker-rename.md
-- .cairn/rules/claude/cairn-claude-runtime-paths.md
-- .cairn/rules/claude/cairn-claude-agent-selection.md
-- .cairn/rules/claude/cairn-claude-skill-entrypoints.md
-- .cairn/rules/claude/cairn-claude-memory-boundary.md
+- @.cairn/rules/core/cairn-core-persistence-layers.md
+- @.cairn/rules/core/cairn-core-atlas.md
+- @.cairn/rules/core/cairn-core-typed-dir-emission.md
+- @.cairn/rules/core/cairn-core-agent-delegation.md
+- @.cairn/rules/core/cairn-core-atlas-marker-rename.md
+- @.cairn/rules/claude/cairn-claude-runtime-paths.md
+- @.cairn/rules/claude/cairn-claude-agent-selection.md
+- @.cairn/rules/claude/cairn-claude-skill-entrypoints.md
+- @.cairn/rules/claude/cairn-claude-memory-boundary.md
 
 When reading `.cairn/handoff/*.md`, also read:
 - .cairn/rules/core/cairn-core-handoff-handling.md
