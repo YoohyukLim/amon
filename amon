@@ -1590,7 +1590,7 @@ def _format_detail_exit_keys(exit_keys: tuple[str, ...]) -> str:
 
 LIST_PROJECT_WIDTH = 18
 LIST_PROJECT_MIN_WIDTH = 8
-LIST_STATUS_WIDTH = 9
+LIST_STATUS_WIDTH = 1
 LIST_ACTIVITY_WIDTH = 8
 LIST_COUNTS_WIDTH = 11
 LIST_LABEL_MIN_WIDTH = 8
@@ -1662,6 +1662,73 @@ def _fit_list_cell(value: str, width: int) -> str:
     return clipped + " " * max(0, width - _display_width(clipped))
 
 
+def _segments_text(segments: list[tuple[str, str]]) -> str:
+    return "".join(text for text, _style in segments)
+
+
+def _take_segments_display_width(
+    segments: list[tuple[str, str]],
+    width: int,
+) -> list[tuple[str, str]]:
+    if width <= 0:
+        return []
+    result: list[tuple[str, str]] = []
+    used = 0
+    for text, style in segments:
+        part = _take_display_width(text, width - used)
+        if part:
+            result.append((part, style))
+            used += _display_width(part)
+        if used >= width:
+            break
+    return result
+
+
+def _fit_list_cell_segments(
+    segments: list[tuple[str, str]],
+    width: int,
+    pad_style: str,
+) -> list[tuple[str, str]]:
+    if width <= 0:
+        return []
+    text = _segments_text(segments)
+    if _display_width(text) <= width:
+        fitted = list(segments)
+    elif width <= 3:
+        fitted = _take_segments_display_width(segments, width)
+    else:
+        fitted = _take_segments_display_width(segments, width - 3)
+        fitted.append(("...", fitted[-1][1] if fitted else pad_style))
+    pad_width = width - _display_width(_segments_text(fitted))
+    if pad_width > 0:
+        fitted.append((" " * pad_width, pad_style))
+    return fitted
+
+
+def _rstrip_segments(segments: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    result = list(segments)
+    while result:
+        text, style = result[-1]
+        stripped = text.rstrip(" ")
+        if stripped:
+            result[-1] = (stripped, style)
+            break
+        result.pop()
+    return result
+
+
+def _join_list_cell_segments(
+    cells: list[list[tuple[str, str]]],
+    separator_style: str,
+) -> list[tuple[str, str]]:
+    segments: list[tuple[str, str]] = []
+    for index, cell in enumerate(cells):
+        if index:
+            segments.append((" ", separator_style))
+        segments.extend(cell)
+    return _rstrip_segments(segments)
+
+
 def _encoding_supports_unicode(encoding: Optional[str]) -> bool:
     return bool(encoding and "utf" in encoding.lower())
 
@@ -1730,11 +1797,15 @@ def _session_counts_label(counts: dict[str, int], now: float) -> str:
     )
 
 
-def _session_counts_segments(counts: dict[str, int]) -> list[tuple[str, str]]:
+def _session_counts_segments(
+    counts: dict[str, int],
+    *,
+    separator_style: str = "header",
+) -> list[tuple[str, str]]:
     segments: list[tuple[str, str]] = []
     for index, status in enumerate(STATUS_COUNT_DISPLAY_ORDER):
         if index:
-            segments.append((" ", "header"))
+            segments.append((" ", separator_style))
         segments.append((f"{_static_status_icon(status)}{counts.get(status, 0)}", status))
     return segments
 
@@ -1806,23 +1877,63 @@ def _format_session_list_columns(
     counts: str,
     layout: ListColumnLayout,
 ) -> str:
+    return _segments_text(
+        _format_session_list_column_segments(
+            selected=selected,
+            highlight=highlight,
+            status=status,
+            agent=agent,
+            session_id=session_id,
+            project=project,
+            label=label,
+            activity=activity,
+            counts=counts,
+            layout=layout,
+        )
+    )
+
+
+def _format_session_list_column_segments(
+    *,
+    selected: str,
+    highlight: str,
+    status: str,
+    agent: str,
+    session_id: str,
+    project: str,
+    label: str,
+    activity: str,
+    counts: str,
+    layout: ListColumnLayout,
+    count_segments: Optional[list[tuple[str, str]]] = None,
+    segment_style: str = "row",
+) -> list[tuple[str, str]]:
     cells = [
-        _fit_list_cell(selected, 1),
-        _fit_list_cell(highlight, 1),
-        _fit_list_cell(status, LIST_STATUS_WIDTH),
+        [(_fit_list_cell(selected, 1), segment_style)],
+        [(_fit_list_cell(highlight, 1), segment_style)],
+        [(_fit_list_cell(status, LIST_STATUS_WIDTH), segment_style)],
     ]
     if layout.show_agent:
-        cells.append(_fit_list_cell(agent, 6))
+        cells.append([(_fit_list_cell(agent, 6), segment_style)])
     if layout.show_session:
-        cells.append(_fit_list_cell(session_id, 8))
+        cells.append([(_fit_list_cell(session_id, 8), segment_style)])
     if layout.show_project:
-        cells.append(_fit_list_cell(project, layout.project_width))
-    cells.append(_fit_list_cell(label, layout.label_width))
+        cells.append([(_fit_list_cell(project, layout.project_width), segment_style)])
+    cells.append([(_fit_list_cell(label, layout.label_width), segment_style)])
     if layout.show_activity:
-        cells.append(_fit_list_cell(activity, LIST_ACTIVITY_WIDTH))
+        cells.append([(_fit_list_cell(activity, LIST_ACTIVITY_WIDTH), segment_style)])
     if layout.show_counts:
-        cells.append(_fit_list_cell(counts, LIST_COUNTS_WIDTH))
-    return " ".join(cells).rstrip()
+        if count_segments is None:
+            cells.append([(_fit_list_cell(counts, LIST_COUNTS_WIDTH), segment_style)])
+        else:
+            cells.append(
+                _fit_list_cell_segments(
+                    count_segments,
+                    LIST_COUNTS_WIDTH,
+                    segment_style,
+                )
+            )
+    return _join_list_cell_segments(cells, segment_style)
 
 
 def _format_session_list_row(
@@ -1833,7 +1944,11 @@ def _format_session_list_row(
     wall_now: float,
     layout: ListColumnLayout,
 ) -> RenderLine:
-    line = _format_session_list_columns(
+    count_segments = _session_counts_segments(
+        entry.status_counts,
+        separator_style="row",
+    )
+    line_segments = _format_session_list_column_segments(
         selected=">" if selected else " ",
         highlight="*" if entry.highlight_until > current else " ",
         status=_session_status_label(entry.status, current),
@@ -1844,13 +1959,16 @@ def _format_session_list_row(
         activity=_session_activity_label(entry.activity_mtime, wall_now),
         counts=_session_counts_label(entry.status_counts, current),
         layout=layout,
+        count_segments=count_segments if layout.show_counts else None,
     )
+    line = _segments_text(line_segments)
     return RenderLine(
         line,
         "row",
         status=entry.status,
         selected=selected,
         highlighted=entry.highlight_until > current,
+        segments=line_segments if layout.show_counts else None,
     )
 
 
@@ -2105,7 +2223,7 @@ def render_session_list_layout(
             _format_session_list_columns(
                 selected=">",
                 highlight="*",
-                status="status",
+                status="",
                 agent="agent",
                 session_id="session",
                 project="project",
@@ -2301,9 +2419,8 @@ def _color_pair_attr(name: Optional[str], color_enabled: bool) -> int:
         return 0
 
 
-def _curses_attr_for_line(line: RenderLine, color_enabled: bool) -> int:
-    style_name = line.status if line.status and line.style in {"row", "subtle"} else line.style
-    attr = _color_pair_attr(style_name, color_enabled)
+def _curses_modifier_attr_for_line(line: RenderLine) -> int:
+    attr = 0
     if line.style in {"subtle", "divider", "exited"}:
         attr |= getattr(curses, "A_DIM", 0)
     if line.highlighted:
@@ -2311,6 +2428,36 @@ def _curses_attr_for_line(line: RenderLine, color_enabled: bool) -> int:
     if line.selected:
         attr |= getattr(curses, "A_REVERSE", 0)
     return attr
+
+
+def _curses_color_name_for_line(line: RenderLine) -> str:
+    if line.status and line.style in {"row", "subtle"}:
+        return line.status
+    return line.style
+
+
+def _curses_color_name_for_segment(line: RenderLine, style_name: str) -> str:
+    if style_name == line.style:
+        return _curses_color_name_for_line(line)
+    return style_name
+
+
+def _curses_attr_for_line(line: RenderLine, color_enabled: bool) -> int:
+    return _color_pair_attr(
+        _curses_color_name_for_line(line),
+        color_enabled,
+    ) | _curses_modifier_attr_for_line(line)
+
+
+def _curses_attr_for_segment(
+    line: RenderLine,
+    style_name: str,
+    color_enabled: bool,
+) -> int:
+    return _color_pair_attr(
+        _curses_color_name_for_segment(line, style_name),
+        color_enabled,
+    ) | _curses_modifier_attr_for_line(line)
 
 
 def _safe_addnstr(stdscr, row: int, column: int, line: str, width: int, attr: int = 0) -> None:
@@ -2356,7 +2503,7 @@ def _draw_render_line(
             column,
             segment_text,
             max(0, width - column),
-            _color_pair_attr(style_name, color_enabled),
+            _curses_attr_for_segment(line, style_name, color_enabled),
         )
         column += _display_width(segment_text)
 

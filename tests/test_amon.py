@@ -1636,6 +1636,10 @@ class TestSessionListState(unittest.TestCase):
         os.utime(path, (mtime, mtime))
         return str(path)
 
+    def _status_column_bounds(self, table_header):
+        agent_col = table_header.index("agent")
+        return agent_col - amon.LIST_STATUS_WIDTH - 1, agent_col
+
     def test_merge_search_hide_and_render_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             active = self._write_jsonl(
@@ -1845,8 +1849,7 @@ class TestSessionListState(unittest.TestCase):
         ]
         rows = [line.text for line in layout if line.style == "row"]
         table_header = layout[2].text
-        status_col = table_header.index("status")
-        agent_col = table_header.index("agent")
+        status_col, agent_col = self._status_column_bounds(table_header)
 
         self.assertEqual(
             section_headers,
@@ -1868,6 +1871,31 @@ class TestSessionListState(unittest.TestCase):
             for status in ("running", "failed", "exited")
         ))
         self.assertFalse(any(line.style == "divider" for line in layout))
+
+    def test_session_list_table_header_omits_status_and_narrows_icon_column(self):
+        state = amon.SessionListState()
+        state.entries["running"] = amon.SessionEntry(
+            session_id="running",
+            agent="codex",
+            path="/tmp/running.jsonl",
+            status="running",
+            label="Running",
+        )
+
+        with mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+            layout = amon.render_session_list_layout(state, width=100, height=9, now=0.0)
+
+        table_header = layout[2].text
+        row = next(line.text for line in layout if line.style == "row")
+        status_col, agent_col = self._status_column_bounds(table_header)
+        old_wide_agent_col = 1 + 1 + 1 + 1 + 9 + 1
+
+        self.assertNotIn("status", table_header)
+        self.assertEqual(amon.LIST_STATUS_WIDTH, 1)
+        self.assertLess(agent_col, old_wide_agent_col)
+        self.assertEqual(table_header[status_col:agent_col].strip(), "")
+        self.assertEqual(row[status_col:agent_col].strip(), "✧")
+        self.assertEqual(row.index("codex"), agent_col)
 
     def test_session_list_layout_renders_empty_status_groups(self):
         state = amon.SessionListState()
@@ -1941,8 +1969,7 @@ class TestSessionListState(unittest.TestCase):
         header = first[2].text
         first_row = next(line.text for line in first if line.style == "row")
         second_row = next(line.text for line in second if line.style == "row")
-        status_col = header.index("status")
-        agent_col = header.index("agent")
+        status_col, agent_col = self._status_column_bounds(header)
 
         self.assertEqual(first_row[status_col:agent_col].strip(), "✧")
         self.assertEqual(second_row[status_col:agent_col].strip(), "✦")
@@ -2023,6 +2050,131 @@ class TestSessionListState(unittest.TestCase):
             [("●1", "running"), ("●1", "failed"), ("?0", "unknown"), ("○0", "exited")],
         )
 
+    def test_session_list_row_count_segments_use_status_color_order(self):
+        state = amon.SessionListState()
+        state.entries["mixed"] = amon.SessionEntry(
+            session_id="mixed",
+            agent="codex",
+            path="/tmp/mixed.jsonl",
+            status="running",
+            label="Mixed counts",
+            status_counts={"failed": 2, "running": 1, "unknown": 3, "exited": 4},
+        )
+
+        with mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+            row = next(
+                line
+                for line in amon.render_session_list_layout(
+                    state,
+                    width=120,
+                    height=6,
+                    now=amon.STATUS_ICON_FRAME_SECONDS,
+                )
+                if line.style == "row"
+            )
+
+        count_segments = [
+            (text, style)
+            for text, style in row.segments or []
+            if style in amon.STATUS_COUNT_DISPLAY_ORDER
+        ]
+        self.assertEqual(row.status, "running")
+        self.assertEqual(amon._segments_text(row.segments), row.text)
+        self.assertTrue(row.text.endswith("●1 ●2 ?3 ○4"))
+        self.assertEqual(
+            count_segments,
+            [("●1", "running"), ("●2", "failed"), ("?3", "unknown"), ("○4", "exited")],
+        )
+
+    def test_session_list_row_count_segment_styles_do_not_collapse_to_row_status(self):
+        state = amon.SessionListState()
+        state.entries["mixed"] = amon.SessionEntry(
+            session_id="mixed",
+            agent="codex",
+            path="/tmp/mixed.jsonl",
+            status="running",
+            label="Mixed counts",
+            status_counts={"failed": 5, "running": 1, "unknown": 0, "exited": 0},
+        )
+
+        with mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+            row = next(
+                line
+                for line in amon.render_session_list_layout(
+                    state,
+                    width=120,
+                    height=6,
+                    now=0.0,
+                )
+                if line.style == "row"
+            )
+
+        self.assertEqual(row.status, "running")
+        self.assertIn(("●5", "failed"), row.segments)
+        self.assertNotIn(("●5", "running"), row.segments)
+
+    def test_draw_render_line_uses_segment_color_with_row_modifiers(self):
+        class FakeScreen:
+            def __init__(self):
+                self.calls = []
+
+            def addnstr(self, *args):
+                self.calls.append(args)
+
+        screen = FakeScreen()
+        line = amon.RenderLine(
+            "row ●1 ●2",
+            "row",
+            status="running",
+            selected=True,
+            segments=[
+                ("row ", "row"),
+                ("●1", "running"),
+                (" ", "row"),
+                ("●2", "failed"),
+            ],
+        )
+        reverse = 1 << 20
+
+        with mock.patch.object(amon.curses, "A_REVERSE", reverse, create=True), \
+            mock.patch.object(amon.curses, "color_pair", side_effect=lambda pair: pair << 8):
+            amon._draw_render_line(screen, 0, line, 80, color_enabled=True)
+
+        attrs_by_text = {args[2]: args[4] for args in screen.calls}
+        self.assertEqual(
+            attrs_by_text["row "],
+            (amon.TUI_COLOR_PAIRS["running"] << 8) | reverse,
+        )
+        self.assertEqual(
+            attrs_by_text["●1"],
+            (amon.TUI_COLOR_PAIRS["running"] << 8) | reverse,
+        )
+        self.assertEqual(
+            attrs_by_text["●2"],
+            (amon.TUI_COLOR_PAIRS["failed"] << 8) | reverse,
+        )
+
+    def test_draw_render_line_keeps_segment_output_plain_without_colors(self):
+        class FakeScreen:
+            def __init__(self):
+                self.calls = []
+
+            def addnstr(self, *args):
+                self.calls.append(args)
+
+        screen = FakeScreen()
+        line = amon.RenderLine(
+            "row ●1",
+            "row",
+            status="running",
+            segments=[("row ", "row"), ("●1", "failed")],
+        )
+
+        amon._draw_render_line(screen, 0, line, 80, color_enabled=False)
+
+        self.assertEqual([args[2] for args in screen.calls], ["row ", "●1"])
+        self.assertEqual([len(args) for args in screen.calls], [4, 4])
+
     def test_status_icon_frames_are_single_cell_with_ascii_fallback(self):
         for frames in amon.UNICODE_STATUS_ICON_FRAMES.values():
             for icon in frames:
@@ -2080,8 +2232,7 @@ class TestSessionListState(unittest.TestCase):
             layout = amon.render_session_list_layout(state, width=100, height=12, now=10)
         selected_rows = [line.text for line in layout if line.style == "row" and line.selected]
         table_header = layout[2].text
-        status_col = table_header.index("status")
-        agent_col = table_header.index("agent")
+        status_col, agent_col = self._status_column_bounds(table_header)
         self.assertEqual(len(selected_rows), 1)
         self.assertEqual(selected_rows[0][status_col:agent_col].strip(), "●")
 
@@ -2180,7 +2331,7 @@ class TestSessionListState(unittest.TestCase):
         row = next(line.text for line in layout if line.style == "row")
 
         self.assertTrue(all(amon._display_width(line.text) <= 30 for line in layout))
-        self.assertIn("status", table_header)
+        self.assertNotIn("status", table_header)
         self.assertIn("label", table_header)
         self.assertNotIn("activity", table_header)
         self.assertNotIn("counts", table_header)
