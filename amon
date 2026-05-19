@@ -7,6 +7,7 @@ import argparse
 import base64
 import curses
 import json
+import locale
 import os
 import re
 import signal
@@ -30,7 +31,22 @@ SCOPE_ALL = "all"
 SCOPE_CURRENT = "current"
 SESSION_STATUSES = ("failed", "running", "unknown", "exited")
 STATUS_PRIORITY = {"failed": 3, "running": 2, "unknown": 1, "exited": 0}
-STATUS_ICONS = {"failed": "!", "running": "R", "unknown": "?", "exited": "x"}
+UNICODE_STATUS_ICON_FRAMES = {
+    "failed": ("●",),
+    "running": ("✦", "✧", "✶", "✧"),
+    "unknown": ("?",),
+    "exited": ("○",),
+}
+ASCII_STATUS_ICON_FRAMES = {
+    "failed": ("!",),
+    "running": ("*", "+", "x", "+"),
+    "unknown": ("?",),
+    "exited": ("o",),
+}
+STATUS_ICONS = {
+    status: frames[0] for status, frames in UNICODE_STATUS_ICON_FRAMES.items()
+}
+STATUS_ICON_FRAME_SECONDS = 0.5
 LIST_STATUS_GROUPS = (
     ("running", "Running"),
     ("failed", "Failed"),
@@ -1213,11 +1229,7 @@ def group_session_entries_by_status(
     for entry in entries:
         status = entry.status if entry.status in grouped else "unknown"
         grouped[status].append(entry)
-    return [
-        (status, title, grouped[status])
-        for status, title in LIST_STATUS_GROUPS
-        if grouped[status]
-    ]
+    return [(status, title, grouped[status]) for status, title in LIST_STATUS_GROUPS]
 
 
 def flatten_status_groups(
@@ -1632,6 +1644,40 @@ def _fit_list_cell(value: str, width: int) -> str:
     return clipped + " " * max(0, width - _display_width(clipped))
 
 
+def _encoding_supports_unicode(encoding: Optional[str]) -> bool:
+    return bool(encoding and "utf" in encoding.lower())
+
+
+def _use_unicode_status_icons() -> bool:
+    if os.environ.get("AMON_ASCII_ICONS"):
+        return False
+    stdout_encoding = getattr(sys.stdout, "encoding", None)
+    if stdout_encoding:
+        return _encoding_supports_unicode(stdout_encoding)
+    return _encoding_supports_unicode(locale.getpreferredencoding(False))
+
+
+def _status_icon_frame_index(now: float) -> int:
+    return int(now / STATUS_ICON_FRAME_SECONDS)
+
+
+def _status_icon(
+    status: str,
+    now: float,
+    *,
+    unicode_icons: Optional[bool] = None,
+) -> str:
+    use_unicode = _use_unicode_status_icons() if unicode_icons is None else unicode_icons
+    icon_frames = UNICODE_STATUS_ICON_FRAMES if use_unicode else ASCII_STATUS_ICON_FRAMES
+    frames = icon_frames.get(status, icon_frames["unknown"])
+    icon = frames[_status_icon_frame_index(now) % len(frames)]
+    if _display_width(icon) == 1:
+        return icon
+
+    fallback_frames = ASCII_STATUS_ICON_FRAMES.get(status, ASCII_STATUS_ICON_FRAMES["unknown"])
+    return fallback_frames[_status_icon_frame_index(now) % len(fallback_frames)]
+
+
 def _session_activity_label(activity_mtime: Optional[float], wall_now: float) -> str:
     if activity_mtime is None:
         return "-"
@@ -1648,12 +1694,15 @@ def _session_activity_label(activity_mtime: Optional[float], wall_now: float) ->
     return time.strftime("%Y-%m", time.localtime(activity_mtime))
 
 
-def _session_counts_label(counts: dict[str, int]) -> str:
-    return " ".join(f"{STATUS_ICONS[status]}{counts.get(status, 0)}" for status in SESSION_STATUSES)
+def _session_counts_label(counts: dict[str, int], now: float) -> str:
+    return " ".join(
+        f"{_status_icon(status, now)}{counts.get(status, 0)}"
+        for status in SESSION_STATUSES
+    )
 
 
-def _session_status_label(status: str) -> str:
-    return f"{STATUS_ICONS.get(status, '?')} {status}"
+def _session_status_label(status: str, now: float) -> str:
+    return _status_icon(status, now)
 
 
 def _list_row_width(layout: ListColumnLayout, label_width: int) -> int:
@@ -1749,13 +1798,13 @@ def _format_session_list_row(
     line = _format_session_list_columns(
         selected=">" if selected else " ",
         highlight="*" if entry.highlight_until > current else " ",
-        status=_session_status_label(entry.status),
+        status=_session_status_label(entry.status, current),
         agent=entry.agent,
         session_id=entry.session_id[:8],
         project=entry.project_display,
         label=entry.label,
         activity=_session_activity_label(entry.activity_mtime, wall_now),
-        counts=_session_counts_label(entry.status_counts),
+        counts=_session_counts_label(entry.status_counts, current),
         layout=layout,
     )
     return RenderLine(
@@ -1811,6 +1860,48 @@ def _render_session_group_block(
     return lines
 
 
+def _minimum_nonempty_group_lines(
+    groups: list[tuple[str, str, list[SessionEntry]]],
+) -> int:
+    return sum(2 for _status, _title, entries in groups if entries)
+
+
+def _allocated_group_row_windows(
+    groups: list[tuple[str, str, list[SessionEntry]]],
+    *,
+    selected_group: int,
+    selected_entry: int,
+    row_capacity: int,
+) -> dict[int, tuple[int, int]]:
+    windows = {group_index: (0, 0) for group_index in range(len(groups))}
+    if row_capacity <= 0:
+        return windows
+
+    entries = groups[selected_group][2]
+    selected_count = min(len(entries), row_capacity)
+    if selected_count:
+        selected_start = min(
+            selected_entry,
+            max(0, len(entries) - selected_count),
+        )
+        windows[selected_group] = (selected_start, selected_count)
+        row_capacity -= selected_count
+
+    group_order = [
+        *range(selected_group + 1, len(groups)),
+        *range(0, selected_group),
+    ]
+    for group_index in group_order:
+        if row_capacity <= 0:
+            break
+        entries = groups[group_index][2]
+        row_count = min(len(entries), row_capacity)
+        if row_count:
+            windows[group_index] = (0, row_count)
+            row_capacity -= row_count
+    return windows
+
+
 def _render_session_group_body(
     groups: list[tuple[str, str, list[SessionEntry]]],
     *,
@@ -1820,10 +1911,44 @@ def _render_session_group_body(
     wall_now: float,
     layout: ListColumnLayout,
 ) -> list[RenderLine]:
-    if row_budget < 2 or not groups:
+    if row_budget <= 0 or not groups:
         return []
 
+    if not flatten_status_groups(groups):
+        return [
+            RenderLine(f"{title} (0)", "subtle", status=status)
+            for status, title, _entries in groups[:row_budget]
+        ]
+
     selected_group, selected_entry = _selected_group_position(groups, cursor)
+
+    if row_budget >= len(groups):
+        windows = _allocated_group_row_windows(
+            groups,
+            selected_group=selected_group,
+            selected_entry=selected_entry,
+            row_capacity=row_budget - len(groups),
+        )
+        body = []
+        for group_index, (status, title, entries) in enumerate(groups):
+            row_start, row_count = windows[group_index]
+            body.extend(
+                _render_session_group_block(
+                    status,
+                    title,
+                    entries,
+                    row_start=row_start,
+                    row_count=row_count,
+                    selected_group_index=selected_group,
+                    selected_entry_index=selected_entry,
+                    group_index=group_index,
+                    current=current,
+                    wall_now=wall_now,
+                    layout=layout,
+                )
+            )
+        return body[:row_budget]
+
     status, title, entries = groups[selected_group]
     selected_rows_budget = row_budget - 1
     row_start = min(selected_entry, max(0, len(entries) - selected_rows_budget))
@@ -1844,8 +1969,16 @@ def _render_session_group_body(
 
     remaining = row_budget - len(body)
     group_index = selected_group + 1
-    while remaining >= 2 and group_index < len(groups):
+    while remaining > 0 and group_index < len(groups):
         status, title, entries = groups[group_index]
+        minimum_lines = 1 + (1 if entries else 0)
+        if not entries and remaining <= _minimum_nonempty_group_lines(
+            groups[group_index + 1 :]
+        ):
+            group_index += 1
+            continue
+        if remaining < minimum_lines:
+            break
         row_count = min(len(entries), remaining - 1)
         body.extend(
             _render_session_group_block(
@@ -1866,8 +1999,16 @@ def _render_session_group_body(
         group_index += 1
 
     group_index = selected_group - 1
-    while remaining >= 2 and group_index >= 0:
+    while remaining > 0 and group_index >= 0:
         status, title, entries = groups[group_index]
+        minimum_lines = 1 + (1 if entries else 0)
+        if not entries and remaining <= _minimum_nonempty_group_lines(
+            groups[:group_index]
+        ):
+            group_index -= 1
+            continue
+        if remaining < minimum_lines:
+            break
         row_count = min(len(entries), remaining - 1)
         row_start = len(entries) - row_count
         body = (
@@ -1907,7 +2048,10 @@ def render_session_list_layout(
     search = f"/{state.query}" if state.query else "-"
     layout = _list_column_layout(width)
     lines = [
-        RenderLine(f"amon sessions total={total} {_format_counts(counts)}", "header"),
+        RenderLine(
+            f"amon sessions total={total} {_session_counts_label(counts, current)}",
+            "header",
+        ),
         RenderLine(
             f"scope={state.scope} project={_scope_project_label(state.scope, state.cwd)} "
             f"search={search} hidden={hidden}",
@@ -1931,9 +2075,7 @@ def render_session_list_layout(
     ]
 
     row_budget = max(0, height - len(lines) - 1)
-    if not visible and row_budget:
-        lines.append(RenderLine("(no sessions found)", "subtle"))
-    elif row_budget:
+    if row_budget:
         cursor = min(state.cursor, max(0, len(flatten_status_groups(groups)) - 1))
         wall_now = time.time()
         lines.extend(

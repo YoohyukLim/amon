@@ -1453,7 +1453,7 @@ class TestDiscovery(unittest.TestCase):
 
             state = amon.SessionListState(scope=amon.SCOPE_ALL)
             state.merge_discovered(sessions, now=10, pid_alive_func=lambda _pid: True)
-            lines = amon.render_session_list_lines(state, width=140, height=8, now=11)
+            lines = amon.render_session_list_lines(state, width=140, height=10, now=11)
 
         self.assertEqual(
             [session["cwd"] for session in sessions],
@@ -1670,10 +1670,15 @@ class TestSessionListState(unittest.TestCase):
                 pid_alive_func=lambda pid: pid == 10,
             )
 
-            lines = amon.render_session_list_lines(state, width=120, height=8, now=11)
-            self.assertIn("running=1", lines[0])
-            self.assertIn("exited=1", lines[0])
-            self.assertTrue(any("> * R running claude active" in line for line in lines))
+            with mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+                lines = amon.render_session_list_lines(state, width=120, height=10, now=11)
+            self.assertIn("✶1", lines[0])
+            self.assertIn("○1", lines[0])
+            self.assertNotIn("running=", lines[0])
+            self.assertTrue(any(
+                line.startswith("> * ✶") and "claude active" in line
+                for line in lines
+            ))
             self.assertFalse(any(line.strip() and set(line.strip()) == {"-"} for line in lines))
 
             amon.handle_session_list_key(state, "/")
@@ -1765,8 +1770,9 @@ class TestSessionListState(unittest.TestCase):
             status_counts={"failed": 0, "running": 0, "unknown": 0, "exited": 1},
         )
 
-        with mock.patch.object(amon.time, "time", return_value=1300):
-            layout = amon.render_session_list_layout(state, width=80, height=8, now=10)
+        with mock.patch.object(amon.time, "time", return_value=1300), \
+            mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+            layout = amon.render_session_list_layout(state, width=80, height=10, now=10)
 
         header = layout[2].text
         rows = [line.text for line in layout if line.style == "row"]
@@ -1780,8 +1786,8 @@ class TestSessionListState(unittest.TestCase):
         self.assertTrue(rows[0][label_col:activity_col].rstrip().endswith("..."))
         self.assertEqual(rows[0][activity_col:counts_col].strip(), "1m ago")
         self.assertEqual(rows[1][activity_col:counts_col].strip(), "2m ago")
-        self.assertEqual(rows[0][counts_col:].strip(), "!0 R1 ?0 x0")
-        self.assertEqual(rows[1][counts_col:].strip(), "!0 R0 ?0 x1")
+        self.assertEqual(rows[0][counts_col:].strip(), "●0 ✦1 ?0 ○0")
+        self.assertEqual(rows[1][counts_col:].strip(), "●0 ✦0 ?0 ○1")
 
     def test_session_list_layout_groups_statuses_and_uses_status_icons(self):
         state = amon.SessionListState()
@@ -1822,7 +1828,8 @@ class TestSessionListState(unittest.TestCase):
             activity_mtime=500,
         )
 
-        layout = amon.render_session_list_layout(state, width=110, height=20, now=10)
+        with mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+            layout = amon.render_session_list_layout(state, width=110, height=20, now=10)
         section_headers = [
             line.text
             for line in layout
@@ -1833,18 +1840,118 @@ class TestSessionListState(unittest.TestCase):
         status_col = table_header.index("status")
         agent_col = table_header.index("agent")
 
-        self.assertEqual(section_headers, ["Running (2)", "Failed (1)", "Exited (1)"])
-        self.assertNotIn("Unknown (0)", [line.text for line in layout])
+        self.assertEqual(
+            section_headers,
+            ["Running (2)", "Failed (1)", "Unknown (0)", "Exited (1)"],
+        )
         self.assertEqual([entry.session_id for entry in state.grouped_visible_entries()], [
             "running-new",
             "running-old",
             "failed",
             "exited",
         ])
-        self.assertEqual(rows[0][status_col:agent_col].strip(), "R running")
-        self.assertEqual(rows[2][status_col:agent_col].strip(), "! failed")
-        self.assertEqual(rows[3][status_col:agent_col].strip(), "x exited")
+        self.assertEqual(rows[0][status_col:agent_col].strip(), "✦")
+        self.assertEqual(rows[2][status_col:agent_col].strip(), "●")
+        self.assertEqual(rows[3][status_col:agent_col].strip(), "○")
+        status_cells = [row[status_col:agent_col].strip() for row in rows]
+        self.assertFalse(any(
+            status in cell
+            for cell in status_cells
+            for status in ("running", "failed", "exited")
+        ))
         self.assertFalse(any(line.style == "divider" for line in layout))
+
+    def test_session_list_layout_renders_empty_status_groups(self):
+        state = amon.SessionListState()
+
+        with mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+            layout = amon.render_session_list_layout(state, width=100, height=10, now=10)
+
+        section_headers = [
+            line.text
+            for line in layout
+            if line.style == "subtle" and line.text.endswith(")")
+        ]
+
+        self.assertEqual(
+            section_headers,
+            ["Running (0)", "Failed (0)", "Unknown (0)", "Exited (0)"],
+        )
+        self.assertFalse(any(line.style == "row" or line.selected for line in layout))
+
+    def test_session_list_constrained_running_group_preserves_empty_headers(self):
+        state = amon.SessionListState()
+        for index in range(8):
+            state.entries[f"running-{index}"] = amon.SessionEntry(
+                session_id=f"running-{index}",
+                agent="codex",
+                path=f"/tmp/running-{index}.jsonl",
+                status="running",
+                label=f"Run {index}",
+                activity_mtime=100 + index,
+            )
+        state.cursor = 3
+
+        with mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+            layout = amon.render_session_list_layout(state, width=100, height=9, now=10)
+
+        section_headers = [
+            line.text
+            for line in layout
+            if line.style == "subtle" and line.text.endswith(")")
+        ]
+        rows = [line for line in layout if line.style == "row"]
+
+        self.assertEqual(
+            section_headers,
+            ["Running (8)", "Failed (0)", "Unknown (0)", "Exited (0)"],
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].selected)
+        self.assertIn("Run 4", rows[0].text)
+
+    def test_session_list_running_status_icon_animates_without_column_shift(self):
+        state = amon.SessionListState()
+        state.entries["running"] = amon.SessionEntry(
+            session_id="running",
+            agent="codex",
+            path="/tmp/running.jsonl",
+            status="running",
+            label="Running",
+            activity_mtime=100,
+        )
+
+        with mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+            first = amon.render_session_list_layout(state, width=100, height=9, now=0.0)
+            second = amon.render_session_list_layout(state, width=100, height=9, now=0.5)
+
+        header = first[2].text
+        first_row = next(line.text for line in first if line.style == "row")
+        second_row = next(line.text for line in second if line.style == "row")
+        status_col = header.index("status")
+        agent_col = header.index("agent")
+
+        self.assertEqual(first_row[status_col:agent_col].strip(), "✦")
+        self.assertEqual(second_row[status_col:agent_col].strip(), "✧")
+        self.assertEqual(
+            amon._display_width(first_row[: first_row.index("codex")]),
+            amon._display_width(header[: header.index("agent")]),
+        )
+        self.assertEqual(
+            amon._display_width(second_row[: second_row.index("codex")]),
+            amon._display_width(header[: header.index("agent")]),
+        )
+
+    def test_status_icon_frames_are_single_cell_with_ascii_fallback(self):
+        for frames in amon.UNICODE_STATUS_ICON_FRAMES.values():
+            for icon in frames:
+                self.assertEqual(amon._display_width(icon), 1)
+        for frames in amon.ASCII_STATUS_ICON_FRAMES.values():
+            for icon in frames:
+                self.assertEqual(amon._display_width(icon), 1)
+
+        with mock.patch.object(amon, "_display_width", return_value=2):
+            self.assertEqual(amon._status_icon("running", 0.0, unicode_icons=True), "*")
 
     def test_session_list_cursor_moves_across_grouped_rows_not_headers(self):
         state = amon.SessionListState()
@@ -1883,10 +1990,14 @@ class TestSessionListState(unittest.TestCase):
         amon.handle_session_list_key(state, "UP")
         self.assertEqual(state.selected_entry().session_id, "failed")
 
-        layout = amon.render_session_list_layout(state, width=100, height=12, now=10)
+        with mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+            layout = amon.render_session_list_layout(state, width=100, height=12, now=10)
         selected_rows = [line.text for line in layout if line.style == "row" and line.selected]
+        table_header = layout[2].text
+        status_col = table_header.index("status")
+        agent_col = table_header.index("agent")
         self.assertEqual(len(selected_rows), 1)
-        self.assertIn("! failed", selected_rows[0])
+        self.assertEqual(selected_rows[0][status_col:agent_col].strip(), "●")
 
     def test_session_list_constrained_group_viewport_keeps_headers_with_rows(self):
         state = amon.SessionListState()
@@ -1947,15 +2058,16 @@ class TestSessionListState(unittest.TestCase):
             status_counts={"failed": 0, "running": 1, "unknown": 0, "exited": 0},
         )
 
-        with mock.patch.object(amon.time, "time", return_value=1300):
-            layout = amon.render_session_list_layout(state, width=80, height=8, now=10)
+        with mock.patch.object(amon.time, "time", return_value=1300), \
+            mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+            layout = amon.render_session_list_layout(state, width=80, height=9, now=10)
 
         header = layout[2].text
         row = next(line.text for line in layout if line.style == "row")
         activity_col = amon._display_width(header[: header.index("activity")])
         counts_col = amon._display_width(header[: header.index("counts")])
         row_activity_col = amon._display_width(row[: row.index("1m ago")])
-        row_counts_col = amon._display_width(row[: row.index("!0 R1 ?0 x0")])
+        row_counts_col = amon._display_width(row[: row.index("●0 ✦1 ?0 ○0")])
 
         self.assertLessEqual(amon._display_width(row), 80)
         self.assertIn("...", row[: row.index("1m ago")])
@@ -1974,8 +2086,9 @@ class TestSessionListState(unittest.TestCase):
             activity_mtime=1240,
         )
 
-        with mock.patch.object(amon.time, "time", return_value=1300):
-            layout = amon.render_session_list_layout(state, width=30, height=8, now=10)
+        with mock.patch.object(amon.time, "time", return_value=1300), \
+            mock.patch.object(amon, "_use_unicode_status_icons", return_value=True):
+            layout = amon.render_session_list_layout(state, width=30, height=9, now=10)
 
         table_header = layout[2].text
         row = next(line.text for line in layout if line.style == "row")
@@ -1986,7 +2099,7 @@ class TestSessionListState(unittest.TestCase):
         self.assertNotIn("activity", table_header)
         self.assertNotIn("counts", table_header)
         self.assertNotIn("project", table_header)
-        self.assertNotIn("!0 R1 ?0 x0", row)
+        self.assertNotIn("●0 ✦1 ?0 ○0", row)
         self.assertFalse(any(line.style == "divider" for line in layout))
 
     def test_curses_attr_uses_status_color_pair_when_enabled(self):
