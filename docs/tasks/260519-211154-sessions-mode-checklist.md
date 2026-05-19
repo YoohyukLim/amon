@@ -76,13 +76,13 @@
 
 ### Stage 3. 상세 로그 UI와 단일 session 공유
 
-- [ ] 기존 session-id 로그 로딩/tail 동작을 새 상세 UI에서 재사용한다.
-- [ ] 최근 N줄 기본 200줄과 `--lines N` 옵션을 구현한다.
-- [ ] `--lines` 양의 정수 validation을 구현한다.
-- [ ] running/unknown/exited/failed별 tail 정책을 구현한다.
-- [ ] 스크롤 시 follow 중단과 끝 이동 시 follow 재개를 구현한다.
-- [ ] 목록 진입 상세와 단일 `amon {session-id}` 상세의 `q` 동작 차이를 구현한다.
-- [ ] 최근 N줄과 tail 정책 테스트를 추가한다.
+- [x] 기존 session-id 로그 로딩/tail 동작을 새 상세 UI에서 재사용한다.
+- [x] 최근 N줄 기본 200줄과 `--lines N` 옵션을 구현한다.
+- [x] `--lines` 양의 정수 validation을 구현한다.
+- [x] running/unknown/exited/failed별 tail 정책을 구현한다.
+- [x] 스크롤 시 follow 중단과 끝 이동 시 follow 재개를 구현한다.
+- [x] 목록 진입 상세와 단일 `amon {session-id}` 상세의 `q` 동작 차이를 구현한다.
+- [x] 최근 N줄과 tail 정책 테스트를 추가한다.
 
 커밋 기준: 상세 로그 UI, 단일 session 공유, 관련 테스트만 포함한다.
 

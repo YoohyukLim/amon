@@ -197,24 +197,19 @@ class TestCliWiring(unittest.TestCase):
             color="never",
         )
 
-    def test_main_session_id_tail_resolves_live_pid(self):
+    def test_main_session_id_opens_detail_with_lines(self):
         with mock.patch.object(
             amon,
             "resolve_path_from_session_id",
             return_value="/tmp/.codex/sessions/run-abcdef.jsonl",
         ):
-            with mock.patch.object(amon.Path, "exists", return_value=True):
-                with mock.patch.object(amon, "resolve_session_pid", return_value=555):
-                    with mock.patch.object(amon, "run_tail", return_value=0) as tail:
-                        code = amon.main(["--session-id", "abcdef"])
+            with mock.patch.object(amon, "run_session_detail_path", return_value=0) as detail:
+                code = amon.main(["--session-id", "abcdef", "--lines", "12"])
         self.assertEqual(code, 0)
-        tail.assert_called_once_with(
+        detail.assert_called_once_with(
             "/tmp/.codex/sessions/run-abcdef.jsonl",
             "codex",
-            "run-abcd",
-            60.0,
-            pid=555,
-            color="never",
+            lines=12,
         )
 
     def test_main_session_path_tail_exits_when_no_live_process_matches(self):
@@ -269,7 +264,12 @@ class TestCliWiring(unittest.TestCase):
         with mock.patch.object(amon, "run_sessions_mode", return_value=0) as sessions_mode:
             code = amon.main([])
         self.assertEqual(code, 0)
-        sessions_mode.assert_called_once_with(60.0, codex_all=False, scope=amon.SCOPE_ALL)
+        sessions_mode.assert_called_once_with(
+            60.0,
+            codex_all=False,
+            scope=amon.SCOPE_ALL,
+            lines=amon.DEFAULT_DETAIL_LINES,
+        )
 
     def test_main_current_calls_sessions_mode_current_scope(self):
         with mock.patch.object(amon, "run_sessions_mode", return_value=0) as sessions_mode:
@@ -279,7 +279,25 @@ class TestCliWiring(unittest.TestCase):
             60.0,
             codex_all=False,
             scope=amon.SCOPE_CURRENT,
+            lines=amon.DEFAULT_DETAIL_LINES,
         )
+
+    def test_main_lines_passes_to_sessions_mode(self):
+        with mock.patch.object(amon, "run_sessions_mode", return_value=0) as sessions_mode:
+            code = amon.main(["--lines", "25"])
+        self.assertEqual(code, 0)
+        sessions_mode.assert_called_once_with(
+            60.0,
+            codex_all=False,
+            scope=amon.SCOPE_ALL,
+            lines=25,
+        )
+
+    def test_main_lines_rejects_non_positive_values(self):
+        with mock.patch.object(amon.sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                amon.main(["--lines", "0"])
+        self.assertEqual(caught.exception.code, 1)
 
     def test_main_xpane_calls_mode_b(self):
         with mock.patch.object(amon, "run_mode_b", return_value=0) as mode_b:
@@ -303,24 +321,19 @@ class TestCliWiring(unittest.TestCase):
             scope=amon.SCOPE_CURRENT,
         )
 
-    def test_main_positional_session_id_resolves_and_tails(self):
+    def test_main_positional_session_id_opens_detail(self):
         with mock.patch.object(
             amon,
             "resolve_path_from_session_id",
             return_value="/tmp/.codex/sessions/run-abcdef.jsonl",
         ):
-            with mock.patch.object(amon.Path, "exists", return_value=True):
-                with mock.patch.object(amon, "resolve_session_pid", return_value=555):
-                    with mock.patch.object(amon, "run_tail", return_value=0) as tail:
-                        code = amon.main(["abcdef"])
+            with mock.patch.object(amon, "run_session_detail_path", return_value=0) as detail:
+                code = amon.main(["abcdef"])
         self.assertEqual(code, 0)
-        tail.assert_called_once_with(
+        detail.assert_called_once_with(
             "/tmp/.codex/sessions/run-abcdef.jsonl",
             "codex",
-            "run-abcd",
-            60.0,
-            pid=555,
-            color="never",
+            lines=amon.DEFAULT_DETAIL_LINES,
         )
 
     def test_main_unknown_positional_target_points_to_xpane(self):
@@ -790,6 +803,144 @@ class TestRunTail(unittest.TestCase):
             self.assertIn("AGENT EXITED", out.getvalue())
 
 
+class TestSessionDetail(unittest.TestCase):
+    def _write_codex_log(self, root, name, messages):
+        path = Path(root) / name
+        path.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": message}],
+                        },
+                    }
+                )
+                + "\n"
+                for message in messages
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_recent_jsonl_events_loads_recent_physical_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            path.write_text(
+                '{"idx":1}\nnot-json\n{"idx":2}\n{"idx":3}\n',
+                encoding="utf-8",
+            )
+
+            events = amon.read_recent_jsonl_events(str(path), 2)
+
+        self.assertEqual(events, [{"idx": 2}, {"idx": 3}])
+
+    def test_recent_log_lines_formats_only_recent_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_codex_log(tmp, "session.jsonl", ["old", "middle", "new"])
+
+            lines = amon.read_recent_log_lines(str(path), "codex", "sid", 2)
+
+        self.assertNotIn("old", "\n".join(lines))
+        self.assertIn("[codex/sid] Msg middle", lines)
+        self.assertIn("[codex/sid] Msg new", lines)
+
+    def test_tail_policy_tails_running_and_unknown_only(self):
+        self.assertTrue(amon.should_tail_detail_status("running"))
+        self.assertTrue(amon.should_tail_detail_status("unknown"))
+        self.assertFalse(amon.should_tail_detail_status("exited"))
+        self.assertFalse(amon.should_tail_detail_status("failed"))
+
+    def test_detail_state_follow_pauses_on_scroll_up_and_resumes_at_bottom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_codex_log(tmp, "session.jsonl", ["one", "two", "three"])
+            entry = amon.SessionEntry(
+                session_id="session",
+                agent="codex",
+                path=str(path),
+                status="exited",
+                label="Session",
+            )
+            state = amon.SessionDetailState(entry, line_count=3)
+            state.clamp_scroll(viewport_lines=2)
+            self.assertTrue(state.follow)
+            self.assertEqual(state.scroll_top, 1)
+
+            amon.handle_session_detail_key(state, "UP", viewport_lines=2)
+            self.assertFalse(state.follow)
+            self.assertEqual(state.scroll_top, 0)
+
+            amon.handle_session_detail_key(state, "DOWN", viewport_lines=2)
+            self.assertTrue(state.follow)
+            self.assertEqual(state.scroll_top, 1)
+
+    def test_detail_state_tails_running_sessions_and_stops_on_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_codex_log(tmp, "session.jsonl", ["old"])
+            entry = amon.SessionEntry(
+                session_id="session",
+                agent="codex",
+                path=str(path),
+                status="running",
+                label="Session",
+            )
+            state = amon.SessionDetailState(entry, line_count=1)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    '{"type":"response_item","payload":{"type":"message","role":"assistant",'
+                    '"content":[{"type":"output_text","text":"new"}]}}\n'
+                )
+                handle.write('{"type":"agent_exit"}\n')
+
+            state.poll_tail()
+
+        self.assertIn("[codex/session] Msg new", state.lines)
+        self.assertTrue(any("AGENT EXITED" in line for line in state.lines))
+        self.assertFalse(state.tail_enabled)
+        self.assertEqual(state.entry.status, "exited")
+
+    def test_render_detail_header_includes_identity_status_and_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_codex_log(tmp, "session.jsonl", ["hello"])
+            entry = amon.SessionEntry(
+                session_id="session",
+                agent="codex",
+                path=str(path),
+                status="running",
+                label="Deploy watcher",
+                project_display="amon",
+                status_counts={"failed": 1, "running": 2, "unknown": 3, "exited": 4},
+            )
+            state = amon.SessionDetailState(entry, line_count=1)
+            lines = amon.render_session_detail_lines(state, width=140, height=6)
+
+        self.assertIn("amon detail Deploy watcher", lines[0])
+        self.assertIn("session=session", lines[1])
+        self.assertIn("project=amon", lines[1])
+        self.assertIn("status=running", lines[1])
+        self.assertIn("failed=1 running=2 unknown=3 exited=4", lines[1])
+
+    def test_explicit_detail_existing_inactive_log_is_exited_static(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_codex_log(tmp, "session.jsonl", ["finished without marker"])
+            out = io.StringIO()
+            with mock.patch.object(amon, "resolve_active_session_record", return_value=None):
+                code = amon.run_session_detail_path(
+                    str(path),
+                    "codex",
+                    lines=10,
+                    output=out,
+                )
+
+        self.assertEqual(code, 0)
+        lines = out.getvalue().splitlines()
+        self.assertTrue(any("status=exited" in line for line in lines))
+        self.assertTrue(any("tail=static" in line for line in lines))
+        self.assertTrue(any("exited=1" in line for line in lines))
+
+
 class TestSnapshot(unittest.TestCase):
     def test_snapshot_working_status(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1223,6 +1374,8 @@ class TestSessionAggregation(unittest.TestCase):
         self.assertEqual(same.status, "failed")
         self.assertEqual(same.label, "Release watcher")
         self.assertIn("claude -p release", same.search_text)
+        self.assertEqual(same.status_counts["failed"], 1)
+        self.assertEqual(same.status_counts["running"], 1)
         self.assertEqual(solo.status, "running")
         self.assertEqual(solo.label, "codex exec inspect")
         self.assertEqual(amon.count_session_statuses(entries)["failed"], 1)
@@ -1328,11 +1481,22 @@ class TestSessionListState(unittest.TestCase):
             self.assertEqual(state.entries["active"].status, "exited")
             self.assertEqual(state.entries["active"].pids, ())
 
-    def test_key_handling_quit_and_enter_placeholder(self):
+    def test_key_handling_quit_and_empty_enter(self):
         state = amon.SessionListState()
         self.assertEqual(amon.handle_session_list_key(state, "q"), "quit")
         self.assertIsNone(amon.handle_session_list_key(state, "ENTER"))
-        self.assertIn("detail view", state.status_message)
+        self.assertIn("no session selected", state.status_message)
+
+    def test_key_handling_enter_opens_selected_detail(self):
+        state = amon.SessionListState()
+        state.entries["session"] = amon.SessionEntry(
+            session_id="session",
+            agent="codex",
+            path="/tmp/session.jsonl",
+            status="running",
+            label="Session",
+        )
+        self.assertEqual(amon.handle_session_list_key(state, "ENTER"), "detail")
 
 
 class TestModeBLauncher(unittest.TestCase):

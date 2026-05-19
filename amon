@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,7 @@ SESSION_STATUSES = ("failed", "running", "unknown", "exited")
 STATUS_PRIORITY = {"failed": 3, "running": 2, "unknown": 1, "exited": 0}
 STATUS_ICONS = {"failed": "!", "running": "R", "unknown": "?", "exited": "x"}
 SESSION_HIGHLIGHT_SECONDS = 3.0
+DEFAULT_DETAIL_LINES = 200
 
 
 class LogSummary:
@@ -57,6 +59,7 @@ class SessionEntry:
         activity_mtime: Optional[float] = None,
         paths: tuple[str, ...] = (),
         pids: tuple[int, ...] = (),
+        status_counts: Optional[dict[str, int]] = None,
         first_seen: float = 0.0,
         last_seen: float = 0.0,
         highlight_until: float = 0.0,
@@ -74,6 +77,9 @@ class SessionEntry:
         self.activity_mtime = activity_mtime
         self.paths = paths
         self.pids = pids
+        self.status_counts = status_counts or {
+            status: (1 if status == self.status else 0) for status in SESSION_STATUSES
+        }
         self.first_seen = first_seen
         self.last_seen = last_seen
         self.highlight_until = highlight_until
@@ -713,7 +719,7 @@ def _normalized_session_path(path: str) -> str:
     return str(Path(path).expanduser().resolve())
 
 
-def resolve_session_pid(session_path: str, agent: str) -> Optional[int]:
+def resolve_active_session_record(session_path: str, agent: str) -> Optional[dict]:
     target = _normalized_session_path(session_path)
     for session in discover_active_sessions(codex_all=True):
         if session.get("agent") != agent:
@@ -723,6 +729,13 @@ def resolve_session_pid(session_path: str, agent: str) -> Optional[int]:
             continue
         if _normalized_session_path(str(candidate)) != target:
             continue
+        return session
+    return None
+
+
+def resolve_session_pid(session_path: str, agent: str) -> Optional[int]:
+    session = resolve_active_session_record(session_path, agent)
+    if session is not None:
         pid = session.get("pid")
         return pid if isinstance(pid, int) else None
     return None
@@ -896,6 +909,61 @@ def read_log_summary(session_path: str, agent: str) -> LogSummary:
     return summary
 
 
+def read_recent_jsonl_events(session_path: str, line_count: int) -> list[dict]:
+    if line_count <= 0:
+        raise ValueError("line_count must be positive")
+
+    path = Path(session_path)
+    if not path.exists():
+        return []
+
+    recent: deque[str] = deque(maxlen=line_count)
+    try:
+        handle = path.open("r", encoding="utf-8")
+    except OSError:
+        return []
+
+    with handle:
+        for line in handle:
+            if line.strip():
+                recent.append(line)
+
+    events: list[dict] = []
+    for line in recent:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _format_detail_event(ev: dict, agent: str, sid_short: str, color: str = "never") -> Optional[str]:
+    if is_agent_exit_event(ev, agent):
+        terminal_status = _event_terminal_status(ev, agent)
+        if terminal_status == "failed":
+            label = _colorize("WARN", "AGENT FAILED", color)
+            return f"[{agent}/{sid_short}] {label}"
+        return _format_exit_line(agent, sid_short, color)
+    return format_event(ev, agent, sid_short, color=color)
+
+
+def read_recent_log_lines(
+    session_path: str,
+    agent: str,
+    sid_short: str,
+    line_count: int,
+    color: str = "never",
+) -> list[str]:
+    lines: list[str] = []
+    for event in read_recent_jsonl_events(session_path, line_count):
+        line = _format_detail_event(event, agent, sid_short, color=color)
+        if line:
+            lines.append(line)
+    return lines
+
+
 def _session_record_status(
     session: dict,
     summary: LogSummary,
@@ -1030,6 +1098,9 @@ def aggregate_sessions(
         commands = _unique_preserve_order(group["commands"])
         label = metadata_values[0] if metadata_values else (commands[0] if commands else group["session_id"])
         search_parts = list(metadata_values) + list(commands) + [group["session_id"]]
+        status_counts = {status: 0 for status in SESSION_STATUSES}
+        for status in group["statuses"]:
+            status_counts[status if status in status_counts else "unknown"] += 1
         entries.append(
             SessionEntry(
                 session_id=group["session_id"],
@@ -1044,6 +1115,7 @@ def aggregate_sessions(
                 activity_mtime=group["activity_mtime"],
                 paths=_unique_preserve_order(group["paths"]),
                 pids=tuple(sorted(set(group["pids"]))),
+                status_counts=status_counts,
             )
         )
 
@@ -1086,7 +1158,7 @@ class SessionListState:
         self.query = ""
         self.searching = False
         self.cursor = 0
-        self.status_message = "Enter detail is pending; q quits"
+        self.status_message = "Enter detail; q quits"
 
     def merge_discovered(
         self,
@@ -1118,6 +1190,8 @@ class SessionListState:
                 continue
             if entry.status == "running":
                 entry.status = "exited"
+                entry.status_counts = {status: 0 for status in SESSION_STATUSES}
+                entry.status_counts["exited"] = 1
             entry.pids = ()
 
         assign_project_displays(list(self.entries.values()), self.scope)
@@ -1153,6 +1227,118 @@ class SessionListState:
             self.cursor = min(max(0, self.cursor), visible_count - 1)
 
 
+def should_tail_detail_status(status: str) -> bool:
+    return status in {"running", "unknown"}
+
+
+def _single_status_counts(status: str) -> dict[str, int]:
+    counts = {candidate: 0 for candidate in SESSION_STATUSES}
+    counts[status if status in counts else "unknown"] = 1
+    return counts
+
+
+def build_session_detail_entry(
+    session_path: str,
+    agent: str,
+    *,
+    session: Optional[dict] = None,
+    pid_alive_func=None,
+) -> SessionEntry:
+    source = dict(session or {"agent": agent, "path": session_path})
+    source.setdefault("agent", agent)
+    source.setdefault("path", session_path)
+    summary = read_log_summary(session_path, agent)
+    status = _session_record_status(source, summary, pid_alive_func=pid_alive_func)
+    metadata_values = _unique_preserve_order(summary.metadata_values)
+    command = _clean_text(source.get("command")) or summary.command
+    session_id = session_id_from_path(session_path)
+    label = metadata_values[0] if metadata_values else (command if command else session_id)
+    pid = source.get("pid")
+    pids = (pid,) if isinstance(pid, int) else ()
+    entry = SessionEntry(
+        session_id=session_id,
+        agent=agent,
+        path=session_path,
+        status=status,
+        label=label,
+        cwd=source.get("cwd"),
+        command=command,
+        metadata_values=metadata_values,
+        search_text=" ".join([*metadata_values, command, session_id]).lower(),
+        activity_mtime=summary.activity_mtime,
+        paths=(session_path,),
+        pids=pids,
+        status_counts=_single_status_counts(status),
+    )
+    assign_project_displays([entry], SCOPE_ALL)
+    return entry
+
+
+class SessionDetailState:
+    def __init__(self, entry: SessionEntry, line_count: int = DEFAULT_DETAIL_LINES):
+        if line_count <= 0:
+            raise ValueError("line_count must be positive")
+        self.entry = entry
+        self.line_count = line_count
+        self.sid_short = short_session_id(entry.path)
+        self.lines = read_recent_log_lines(
+            entry.path,
+            entry.agent,
+            self.sid_short,
+            line_count,
+        )
+        self.follow = True
+        self.scroll_top = 0
+        self.tail_enabled = should_tail_detail_status(entry.status) and Path(entry.path).exists()
+        self.tail = JsonlTail(entry.path) if self.tail_enabled else None
+        if self.tail is not None:
+            self.tail.read_new_lines()
+        self.status_message = "live tail" if self.tail_enabled else "static log"
+
+    def max_scroll_top(self, viewport_lines: int) -> int:
+        return max(0, len(self.lines) - max(1, viewport_lines))
+
+    def clamp_scroll(self, viewport_lines: int) -> None:
+        maximum = self.max_scroll_top(viewport_lines)
+        if self.follow:
+            self.scroll_top = maximum
+        else:
+            self.scroll_top = min(max(0, self.scroll_top), maximum)
+            if self.scroll_top >= maximum:
+                self.follow = True
+
+    def scroll_up(self, amount: int, viewport_lines: int) -> None:
+        self.follow = False
+        self.scroll_top = max(0, self.scroll_top - amount)
+        self.clamp_scroll(viewport_lines)
+
+    def scroll_down(self, amount: int, viewport_lines: int) -> None:
+        self.scroll_top = min(self.max_scroll_top(viewport_lines), self.scroll_top + amount)
+        self.clamp_scroll(viewport_lines)
+
+    def poll_tail(self) -> None:
+        if self.tail is None or not self.tail_enabled:
+            return
+
+        appended = False
+        for event in self.tail.read_new_lines():
+            line = _format_detail_event(event, self.entry.agent, self.sid_short)
+            if line:
+                self.lines.append(line)
+                appended = True
+            terminal_status = _event_terminal_status(event, self.entry.agent)
+            if terminal_status:
+                self.entry.status = terminal_status
+                self.entry.status_counts = _single_status_counts(terminal_status)
+                self.tail_enabled = False
+                self.tail = None
+                self.status_message = "session ended"
+                break
+
+        if appended and self.follow:
+            self.scroll_top = self.max_scroll_top(1)
+
+
 def handle_session_list_key(state: SessionListState, key: str) -> Optional[str]:
     if state.searching:
         if key == "ENTER":
@@ -1185,7 +1371,31 @@ def handle_session_list_key(state: SessionListState, key: str) -> Optional[str]:
         state.cursor = min(max(0, len(state.visible_entries()) - 1), state.cursor + 1)
         return None
     if key == "ENTER":
-        state.status_message = "detail view is not implemented in this stage"
+        if state.visible_entries():
+            return "detail"
+        state.status_message = "no session selected"
+        return None
+    return None
+
+
+def handle_session_detail_key(
+    state: SessionDetailState,
+    key: str,
+    viewport_lines: int,
+) -> Optional[str]:
+    if key == "q":
+        return "quit"
+    if key == "UP":
+        state.scroll_up(1, viewport_lines)
+        return None
+    if key == "DOWN":
+        state.scroll_down(1, viewport_lines)
+        return None
+    if key == "PAGE_UP":
+        state.scroll_up(max(1, viewport_lines - 1), viewport_lines)
+        return None
+    if key == "PAGE_DOWN":
+        state.scroll_down(max(1, viewport_lines - 1), viewport_lines)
         return None
     return None
 
@@ -1226,7 +1436,7 @@ def render_session_list_lines(
         f"amon sessions total={total} {_format_counts(counts)}",
         f"scope={state.scope} project={_scope_project_label(state.scope, state.cwd)} "
         f"search={search} hidden={hidden}",
-        "! failed  R running  ? unknown  x exited    / search  r hide done  q quit",
+        "! failed  R running  ? unknown  x exited    Enter detail  / search  r hide done  q quit",
     ]
 
     row_budget = max(1, height - len(lines) - 1)
@@ -1258,6 +1468,35 @@ def render_session_list_lines(
     return [_clip_line(line, width) for line in lines[:height]]
 
 
+def render_session_detail_lines(
+    state: SessionDetailState,
+    width: int = 100,
+    height: int = 24,
+    *,
+    exit_label: str = "back",
+) -> list[str]:
+    counts = _format_counts(state.entry.status_counts)
+    header = [
+        f"amon detail {state.entry.label}",
+        (
+            f"session={state.entry.session_id} agent={state.entry.agent} "
+            f"project={state.entry.project_display} status={state.entry.status} {counts}"
+        ),
+        (
+            f"tail={'live' if state.tail_enabled else 'static'} "
+            f"follow={'on' if state.follow else 'off'} lines={state.line_count} "
+            f"q {exit_label}"
+        ),
+    ]
+    log_budget = max(1, height - len(header))
+    state.clamp_scroll(log_budget)
+    if state.lines:
+        body = state.lines[state.scroll_top : state.scroll_top + log_budget]
+    else:
+        body = ["(no log events)"]
+    return [_clip_line(line, width) for line in (header + body)[:height]]
+
+
 def _curses_key_name(key: int) -> Optional[str]:
     if key == -1:
         return None
@@ -1265,6 +1504,10 @@ def _curses_key_name(key: int) -> Optional[str]:
         return "UP"
     if key == curses.KEY_DOWN:
         return "DOWN"
+    if key == curses.KEY_PPAGE:
+        return "PAGE_UP"
+    if key == curses.KEY_NPAGE:
+        return "PAGE_DOWN"
     if key in (curses.KEY_ENTER, 10, 13):
         return "ENTER"
     if key in (curses.KEY_BACKSPACE, 8, 127):
@@ -1288,12 +1531,68 @@ def _draw_session_list(stdscr, state: SessionListState, now: float) -> None:
     stdscr.refresh()
 
 
+def _draw_session_detail(
+    stdscr,
+    state: SessionDetailState,
+    *,
+    exit_label: str = "back",
+) -> int:
+    height, width = stdscr.getmaxyx()
+    lines = render_session_detail_lines(
+        state,
+        width=max(1, width - 1),
+        height=height,
+        exit_label=exit_label,
+    )
+    stdscr.erase()
+    for row, line in enumerate(lines):
+        try:
+            stdscr.addnstr(row, 0, line, max(0, width - 1))
+        except curses.error:
+            pass
+    stdscr.refresh()
+    return max(1, height - 3)
+
+
+def _run_session_detail_tui(
+    stdscr,
+    entry: SessionEntry,
+    *,
+    line_count: int,
+    exit_label: str = "back",
+    poll_interval: float = 1.0,
+) -> int:
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    stdscr.timeout(100)
+
+    state = SessionDetailState(entry, line_count=line_count)
+    next_poll = 0.0
+
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= next_poll:
+                state.poll_tail()
+                next_poll = now + poll_interval
+
+            viewport_lines = _draw_session_detail(stdscr, state, exit_label=exit_label)
+            key = _curses_key_name(stdscr.getch())
+            if key and handle_session_detail_key(state, key, viewport_lines) == "quit":
+                return 0
+    except KeyboardInterrupt:
+        return 0
+
+
 def _run_sessions_tui(
     stdscr,
     codex_all: bool,
     scope: str,
     cwd: Optional[str],
     *,
+    line_count: int = DEFAULT_DETAIL_LINES,
     poll_interval: float = 1.0,
 ) -> int:
     try:
@@ -1315,8 +1614,21 @@ def _run_sessions_tui(
 
             _draw_session_list(stdscr, state, now)
             key = _curses_key_name(stdscr.getch())
-            if key and handle_session_list_key(state, key) == "quit":
-                return 0
+            if key:
+                action = handle_session_list_key(state, key)
+                if action == "quit":
+                    return 0
+                if action == "detail":
+                    visible = state.visible_entries()
+                    if visible:
+                        selected = visible[min(state.cursor, len(visible) - 1)]
+                        _run_session_detail_tui(
+                            stdscr,
+                            selected,
+                            line_count=line_count,
+                            exit_label="back",
+                            poll_interval=poll_interval,
+                        )
     except KeyboardInterrupt:
         return 0
 
@@ -1358,6 +1670,7 @@ def run_sessions_mode(
     codex_all: bool,
     scope: str = SCOPE_ALL,
     cwd: Optional[str] = None,
+    lines: int = DEFAULT_DETAIL_LINES,
     *,
     output=None,
     error=None,
@@ -1379,8 +1692,52 @@ def run_sessions_mode(
             codex_all=codex_all,
             scope=scope,
             cwd=cwd,
+            line_count=lines,
         )
     )
+
+
+def run_session_detail(
+    entry: SessionEntry,
+    lines: int = DEFAULT_DETAIL_LINES,
+    *,
+    output=None,
+) -> int:
+    stream = output or sys.stdout
+    if output is not None or not stream.isatty():
+        state = SessionDetailState(entry, line_count=lines)
+        for line in render_session_detail_lines(state):
+            print(line, file=stream)
+        return 0
+
+    return curses.wrapper(
+        lambda stdscr: _run_session_detail_tui(
+            stdscr,
+            entry,
+            line_count=lines,
+            exit_label="quit",
+        )
+    )
+
+
+def run_session_detail_path(
+    session_path: str,
+    agent: str,
+    lines: int = DEFAULT_DETAIL_LINES,
+    *,
+    output=None,
+    error=None,
+) -> int:
+    err = error or sys.stderr
+    if not Path(session_path).exists():
+        print(f"amon: session path missing: {session_path}", file=err)
+        return 1
+    active_session = resolve_active_session_record(session_path, agent)
+    entry = build_session_detail_entry(session_path, agent, session=active_session)
+    if active_session is None and entry.status == "unknown":
+        entry.status = "exited"
+        entry.status_counts = _single_status_counts("exited")
+    return run_session_detail(entry, lines=lines, output=output)
 
 
 def infer_agent_from_path(path: str) -> str:
@@ -1400,6 +1757,16 @@ class AmonArgumentParser(argparse.ArgumentParser):
         self.exit(1, f"{self.prog}: error: {message}\n")
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = AmonArgumentParser(
         prog="amon",
@@ -1410,7 +1777,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  amon --current               list sessions under the current cwd\n"
             "  amon xpane                   open the existing xpanes view\n"
             "  amon xpane --current         open xpanes for sessions under the current cwd\n"
-            "  amon ID                      tail one resolved session"
+            "  amon ID                      open one resolved session detail view"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1432,6 +1799,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--codex-all-sessions",
         action="store_true",
         help="monitor every Codex JSONL held by a discovered codex exec process",
+    )
+    parser.add_argument(
+        "--lines",
+        type=positive_int,
+        default=DEFAULT_DETAIL_LINES,
+        help=f"recent log lines to load in session detail views (default: {DEFAULT_DETAIL_LINES})",
     )
     parser.add_argument(
         "--color",
@@ -1487,6 +1860,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     color = args.color or "never"
     pid = args.pid
+    use_detail_view = False
     if targets:
         target = " ".join(targets)
         if len(targets) != 1:
@@ -1497,11 +1871,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             _print_unknown_target_error(target)
             return 1
         agent = infer_agent_from_path(session_path)
+        use_detail_view = True
     elif not _direct_session_args(args):
         return run_sessions_mode(
             args.idle_threshold,
             codex_all=args.codex_all_sessions,
             scope=scope,
+            lines=args.lines,
         )
     elif args.session_spec:
         try:
@@ -1521,6 +1897,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"amon: session id not found: {args.session_id}", file=sys.stderr)
             return 1
         agent = infer_agent_from_path(session_path)
+        use_detail_view = True
 
     sid_short = short_session_id(session_path)
     if args.once:
@@ -1537,6 +1914,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             pid=pid,
             process_state=process_state,
         )
+
+    if use_detail_view:
+        return run_session_detail_path(session_path, agent, lines=args.lines)
 
     if not Path(session_path).exists():
         print(f"amon: session path missing: {session_path}", file=sys.stderr)
