@@ -14,6 +14,6 @@
 
 ## Last Sync
 
-- ref: 937eca09b362c0a5e82a8a67f7e3c7e646b42dc1
-- at: 2026-05-18T23:45:46Z
-- by: atlas-init
+- ref: 011099e5ed8bbfa7ed96894ddbf93c8e732b2559
+- at: 2026-05-19T03:53:37Z
+- by: atlas-sync (smart-default)
