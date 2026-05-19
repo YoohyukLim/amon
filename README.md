@@ -58,7 +58,8 @@ Mode B requires `xpanes`. If `xpanes` is missing, `amon` exits with code `3`.
 Mode B always starts spawned monitor panes with `--color=always`; direct Mode A
 defaults to `--color=never` unless you pass a color flag. Mode B also labels
 each pane border as `{runtime}/{session-uuid}` when `tmux` supports pane
-titles; non-UUID session filenames fall back to their full stem.
+titles; non-UUID session filenames fall back to their full stem. Panes keep
+their shell open after a monitor exits so the final output remains visible.
 
 ## Exit Codes
 

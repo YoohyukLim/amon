@@ -579,7 +579,7 @@ def run_mode_b(
     script = shlex.quote(str(Path(__file__).resolve()))
     template = (
         f"printf '\\033]2;%s\\033\\\\' \"$({script} --session-title {{}})\"; "
-        f"exec {script} --session-spec {{}} --idle-threshold {idle_threshold:g} "
+        f"{script} --session-spec {{}} --idle-threshold {idle_threshold:g} "
         f"--color={color}"
     )
     proc = subprocess.run([xpanes, "-t", "-c", template, *specs], check=False)

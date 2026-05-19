@@ -698,6 +698,7 @@ class TestModeBLauncher(unittest.TestCase):
         self.assertIn("--session-spec {}", args[3])
         self.assertIn("--idle-threshold 45", args[3])
         self.assertIn("--color=always", args[3])
+        self.assertNotIn("exec ", args[3])
         self.assertNotIn("/tmp/path with spaces/session.jsonl", args[3])
         self.assertEqual(amon.decode_session_spec(args[4]), session)
 
