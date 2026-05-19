@@ -210,6 +210,7 @@ class TestCliWiring(unittest.TestCase):
             "/tmp/.codex/sessions/run-abcdef.jsonl",
             "codex",
             lines=12,
+            color="auto",
         )
 
     def test_main_session_path_tail_exits_when_no_live_process_matches(self):
@@ -269,6 +270,7 @@ class TestCliWiring(unittest.TestCase):
             codex_all=False,
             scope=amon.SCOPE_ALL,
             lines=amon.DEFAULT_DETAIL_LINES,
+            color="auto",
         )
 
     def test_main_current_calls_sessions_mode_current_scope(self):
@@ -280,6 +282,7 @@ class TestCliWiring(unittest.TestCase):
             codex_all=False,
             scope=amon.SCOPE_CURRENT,
             lines=amon.DEFAULT_DETAIL_LINES,
+            color="auto",
         )
 
     def test_main_lines_passes_to_sessions_mode(self):
@@ -291,6 +294,7 @@ class TestCliWiring(unittest.TestCase):
             codex_all=False,
             scope=amon.SCOPE_ALL,
             lines=25,
+            color="auto",
         )
 
     def test_main_lines_rejects_non_positive_values(self):
@@ -334,6 +338,7 @@ class TestCliWiring(unittest.TestCase):
             "/tmp/.codex/sessions/run-abcdef.jsonl",
             "codex",
             lines=amon.DEFAULT_DETAIL_LINES,
+            color="auto",
         )
 
     def test_main_unknown_positional_target_points_to_xpane(self):
@@ -378,9 +383,25 @@ class TestCliWiring(unittest.TestCase):
             "codex",
             "run-abcd",
             60.0,
-            color="always",
+            color="never",
             pid=555,
             process_state="alive",
+        )
+
+    def test_main_session_id_detail_uses_requested_color(self):
+        with mock.patch.object(
+            amon,
+            "resolve_path_from_session_id",
+            return_value="/tmp/.codex/sessions/run-abcdef.jsonl",
+        ):
+            with mock.patch.object(amon, "run_session_detail_path", return_value=0) as detail:
+                code = amon.main(["--session-id", "abcdef", "--color", "always"])
+        self.assertEqual(code, 0)
+        detail.assert_called_once_with(
+            "/tmp/.codex/sessions/run-abcdef.jsonl",
+            "codex",
+            lines=amon.DEFAULT_DETAIL_LINES,
+            color="always",
         )
 
 
@@ -959,6 +980,11 @@ class TestSessionDetail(unittest.TestCase):
         self.assertIn("q/Backspace/Esc back", list_lines[2])
         self.assertIn("q quit", direct_lines[2])
 
+    def test_detail_body_style_marks_tool_warning_and_exit_lines(self):
+        self.assertEqual(amon._detail_body_style("[codex/sid] Tool exec_command ls"), "tool")
+        self.assertEqual(amon._detail_body_style("[codex/sid] IDLE idle=60s"), "warn")
+        self.assertEqual(amon._detail_body_style("[codex/sid] AGENT EXITED"), "exited")
+
     def test_detail_state_follow_pauses_on_scroll_up_and_resumes_at_bottom(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_codex_log(tmp, "session.jsonl", ["one", "two", "three"])
@@ -1268,7 +1294,7 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("missing", line)
 
-    def test_snapshot_color_passthrough(self):
+    def test_snapshot_ignores_color_and_stays_plain(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "session.jsonl"
             path.write_text((FIXTURES / "codex_session.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
@@ -1282,7 +1308,8 @@ class TestSnapshot(unittest.TestCase):
                 now_func=lambda: 1000,
             )
             self.assertEqual(code, 0)
-            self.assertIn("\033[", line)
+            self.assertNotIn("\033[", line)
+            self.assertIn("last=Tool exec_command ls -la", line)
 
     def test_run_snapshot_writes_to_error_for_missing_path(self):
         err = io.StringIO()
@@ -1646,7 +1673,8 @@ class TestSessionListState(unittest.TestCase):
             lines = amon.render_session_list_lines(state, width=120, height=8, now=11)
             self.assertIn("running=1", lines[0])
             self.assertIn("exited=1", lines[0])
-            self.assertTrue(any("* R claude active" in line for line in lines))
+            self.assertTrue(any("> * | R running | claude | active" in line for line in lines))
+            self.assertTrue(any(line.strip() and set(line.strip()) == {"-"} for line in lines))
 
             amon.handle_session_list_key(state, "/")
             amon.handle_session_list_key(state, "a")
@@ -1690,6 +1718,34 @@ class TestSessionListState(unittest.TestCase):
             label="Session",
         )
         self.assertEqual(amon.handle_session_list_key(state, "ENTER"), "detail")
+
+    def test_session_list_layout_carries_status_selection_and_new_highlight(self):
+        state = amon.SessionListState()
+        state.entries["session"] = amon.SessionEntry(
+            session_id="session",
+            agent="codex",
+            path="/tmp/session.jsonl",
+            status="running",
+            label="Session",
+            highlight_until=20,
+        )
+
+        layout = amon.render_session_list_layout(state, width=120, height=6, now=10)
+        row = next(line for line in layout if "| R running |" in line.text)
+        attr = amon._curses_attr_for_line(row, color_enabled=False)
+
+        self.assertEqual(row.style, "row")
+        self.assertEqual(row.status, "running")
+        self.assertTrue(row.selected)
+        self.assertTrue(row.highlighted)
+        self.assertTrue(attr & amon.curses.A_REVERSE)
+        self.assertTrue(attr & amon.curses.A_BOLD)
+
+    def test_curses_attr_uses_status_color_pair_when_enabled(self):
+        line = amon.RenderLine("row", "row", status="failed")
+        with mock.patch.object(amon.curses, "color_pair", side_effect=lambda pair: pair * 1000):
+            attr = amon._curses_attr_for_line(line, color_enabled=True)
+        self.assertEqual(attr, amon.TUI_COLOR_PAIRS["failed"] * 1000)
 
 
 class TestModeBLauncher(unittest.TestCase):

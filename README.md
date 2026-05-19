@@ -50,7 +50,8 @@ amon
 The default view is a sessions TUI. It refreshes discovery every second, groups
 rows by session id, and opens a session detail log with `Enter`. Use `/` to
 filter, `r` to hide visible finished sessions for the current run, and `q` to
-quit.
+quit. On terminals with color support, the sessions TUI and detail views color
+statuses and tool lines by default; pass `--color=never` to keep them plain.
 
 Limit discovery to sessions whose process cwd is under the current directory:
 
@@ -99,7 +100,8 @@ amon --session-id <session-id> --once
 ```
 
 Snapshot output includes `process=alive|exited|unknown`. When a PID is known,
-the line also includes `pid=N`.
+the line also includes `pid=N`. Snapshot output is always plain text, even when
+`--color=always` is supplied.
 
 ## Flags
 
@@ -110,7 +112,8 @@ the line also includes `pid=N`.
 - `--idle-threshold N` sets the idle warning/status threshold in seconds.
 - `--codex-all-sessions` includes all open Codex session JSONLs in discovery
   views.
-- `--color {always,never,auto}` controls color for direct single-session output.
+- `--color {always,never,auto}` controls color for TUI views and direct tail
+  output. `--once` snapshots ignore it and stay plain.
 
 `amon xpane` requires `xpanes`. If `xpanes` is missing, it exits with code `3`.
 The xpane launcher starts spawned monitor panes with `--color=always`, labels

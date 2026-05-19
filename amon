@@ -34,6 +34,16 @@ SESSION_HIGHLIGHT_SECONDS = 3.0
 DEFAULT_DETAIL_LINES = 200
 DETAIL_DIRECT_EXIT_KEYS = ("q",)
 DETAIL_LIST_DETAIL_EXIT_KEYS = ("q", "BACKSPACE", "ESC")
+TUI_COLOR_PAIRS = {
+    "header": 1,
+    "subtle": 2,
+    "failed": 3,
+    "running": 4,
+    "unknown": 5,
+    "exited": 6,
+    "tool": 7,
+    "warn": 8,
+}
 
 
 class LogSummary:
@@ -85,6 +95,23 @@ class SessionEntry:
         self.first_seen = first_seen
         self.last_seen = last_seen
         self.highlight_until = highlight_until
+
+
+class RenderLine:
+    def __init__(
+        self,
+        text: str,
+        style: str = "normal",
+        *,
+        status: Optional[str] = None,
+        selected: bool = False,
+        highlighted: bool = False,
+    ):
+        self.text = text
+        self.style = style
+        self.status = status
+        self.selected = selected
+        self.highlighted = highlighted
 
 
 def cwd_to_claude_slug(cwd: str) -> str:
@@ -521,7 +548,7 @@ def snapshot_status(
                 continue
             if not isinstance(event, dict):
                 continue
-            detail = _format_event_detail(event, agent, color=color)
+            detail = _format_event_detail(event, agent, color="never")
             if detail:
                 last_event = detail
 
@@ -1277,17 +1304,24 @@ def build_session_detail_entry(
 
 
 class SessionDetailState:
-    def __init__(self, entry: SessionEntry, line_count: int = DEFAULT_DETAIL_LINES):
+    def __init__(
+        self,
+        entry: SessionEntry,
+        line_count: int = DEFAULT_DETAIL_LINES,
+        color: str = "never",
+    ):
         if line_count <= 0:
             raise ValueError("line_count must be positive")
         self.entry = entry
         self.line_count = line_count
+        self.color = color
         self.sid_short = short_session_id(entry.path)
         self.lines = read_recent_log_lines(
             entry.path,
             entry.agent,
             self.sid_short,
             line_count,
+            color=color,
         )
         self.follow = True
         self.scroll_top = 0
@@ -1325,7 +1359,12 @@ class SessionDetailState:
         appended = False
         ended_status = None
         for event in self.tail.read_new_lines():
-            line = _format_detail_event(event, self.entry.agent, self.sid_short)
+            line = _format_detail_event(
+                event,
+                self.entry.agent,
+                self.sid_short,
+                color=self.color,
+            )
             if line:
                 self.lines.append(line)
                 appended = True
@@ -1356,7 +1395,7 @@ class SessionDetailState:
         self.tail_enabled = False
         self.tail = None
         self.status_message = "process ended"
-        exit_line = _format_exit_line(self.entry.agent, self.sid_short, "never")
+        exit_line = _format_exit_line(self.entry.agent, self.sid_short, self.color)
         if not self.lines or self.lines[-1] != exit_line:
             self.lines.append(exit_line)
         if self.follow:
@@ -1437,6 +1476,16 @@ def _clip_line(line: str, width: int) -> str:
     return line[: width - 3] + "..."
 
 
+def _clip_render_line(item: RenderLine, width: int) -> RenderLine:
+    return RenderLine(
+        _clip_line(item.text, width),
+        item.style,
+        status=item.status,
+        selected=item.selected,
+        highlighted=item.highlighted,
+    )
+
+
 def _scope_project_label(scope: str, cwd: Optional[str]) -> str:
     if scope == SCOPE_CURRENT:
         return Path(_realpath(cwd or os.getcwd())).name or _realpath(cwd or os.getcwd())
@@ -1452,12 +1501,16 @@ def _format_detail_exit_keys(exit_keys: tuple[str, ...]) -> str:
     return "/".join(labels.get(key, key) for key in exit_keys)
 
 
-def render_session_list_lines(
+def _list_row_divider(width: int) -> str:
+    return "    " + "-" * max(0, width - 4)
+
+
+def render_session_list_layout(
     state: SessionListState,
     width: int = 100,
     height: int = 24,
     now: Optional[float] = None,
-) -> list[str]:
+) -> list[RenderLine]:
     current = time.monotonic() if now is None else now
     visible = state.visible_entries()
     counts = count_session_statuses(visible)
@@ -1465,21 +1518,30 @@ def render_session_list_lines(
     hidden = len(state.hidden_session_ids)
     search = f"/{state.query}" if state.query else "-"
     lines = [
-        f"amon sessions total={total} {_format_counts(counts)}",
-        f"scope={state.scope} project={_scope_project_label(state.scope, state.cwd)} "
-        f"search={search} hidden={hidden}",
-        "! failed  R running  ? unknown  x exited    Enter detail  / search  r hide done  q quit",
+        RenderLine(f"amon sessions total={total} {_format_counts(counts)}", "header"),
+        RenderLine(
+            f"scope={state.scope} project={_scope_project_label(state.scope, state.cwd)} "
+            f"search={search} hidden={hidden}",
+            "subtle",
+        ),
+        RenderLine(
+            "sel new | status    | agent  | session  | project            | label"
+            "    Enter detail  / search  r hide done  q quit",
+            "subtle",
+        ),
     ]
 
-    row_budget = max(1, height - len(lines) - 1)
+    row_budget = max(0, height - len(lines) - 1)
+    max_rows = (row_budget + 1) // 2 if row_budget else 0
     cursor = min(state.cursor, max(0, len(visible) - 1))
     start = 0
-    if cursor >= row_budget:
-        start = cursor - row_budget + 1
-    rows = visible[start : start + row_budget]
+    if max_rows and cursor >= max_rows:
+        start = cursor - max_rows + 1
+    rows = visible[start : start + max_rows] if max_rows else []
 
-    if not rows:
-        lines.append("(no sessions found)")
+    body_used = 0
+    if not visible and row_budget:
+        lines.append(RenderLine("(no sessions found)", "subtle"))
     else:
         for offset, entry in enumerate(rows, start=start):
             selected = ">" if offset == cursor else " "
@@ -1487,17 +1549,98 @@ def render_session_list_lines(
             icon = STATUS_ICONS.get(entry.status, "?")
             sid = entry.session_id[:8]
             line = (
-                f"{selected}{highlight} {icon} {entry.agent:<6} {sid:<8} "
-                f"{entry.project_display:<18} {entry.label}"
+                f"{selected} {highlight} | {icon} {entry.status:<7} | {entry.agent:<6} "
+                f"| {sid:<8} | {entry.project_display:<18} | {entry.label}"
             )
-            lines.append(line)
+            lines.append(
+                RenderLine(
+                    line,
+                    "row",
+                    status=entry.status,
+                    selected=offset == cursor,
+                    highlighted=entry.highlight_until > current,
+                )
+            )
+            body_used += 1
+            if offset < start + len(rows) - 1 and body_used < row_budget:
+                lines.append(RenderLine(_list_row_divider(width), "divider"))
+                body_used += 1
 
     if state.searching:
         status_line = f"search: /{state.query}"
     else:
         status_line = state.status_message
-    lines.append(status_line)
-    return [_clip_line(line, width) for line in lines[:height]]
+    lines.append(RenderLine(status_line, "subtle"))
+    return [_clip_render_line(line, width) for line in lines[:height]]
+
+
+def render_session_list_lines(
+    state: SessionListState,
+    width: int = 100,
+    height: int = 24,
+    now: Optional[float] = None,
+) -> list[str]:
+    return [
+        line.text
+        for line in render_session_list_layout(
+            state,
+            width=width,
+            height=height,
+            now=now,
+        )
+    ]
+
+
+def _detail_body_style(line: str) -> str:
+    if "AGENT FAILED" in line:
+        return "failed"
+    if "AGENT EXITED" in line:
+        return "exited"
+    if "] IDLE" in line or " IDLE " in line:
+        return "warn"
+    if "] Tool " in line:
+        return "tool"
+    return "normal"
+
+
+def render_session_detail_layout(
+    state: SessionDetailState,
+    width: int = 100,
+    height: int = 24,
+    *,
+    exit_label: str = "back",
+    exit_keys: tuple[str, ...] = DETAIL_DIRECT_EXIT_KEYS,
+) -> list[RenderLine]:
+    counts = _format_counts(state.entry.status_counts)
+    header = [
+        RenderLine(f"amon detail {state.entry.label}", "header"),
+        RenderLine(
+            (
+                f"session={state.entry.session_id} agent={state.entry.agent} "
+                f"project={state.entry.project_display} status={state.entry.status} {counts}"
+            ),
+            "row",
+            status=state.entry.status,
+        ),
+        RenderLine(
+            (
+                f"tail={'live' if state.tail_enabled else 'static'} "
+                f"follow={'on' if state.follow else 'off'} lines={state.line_count} "
+                f"{_format_detail_exit_keys(exit_keys)} {exit_label}"
+            ),
+            "subtle",
+        ),
+    ]
+    log_budget = max(1, height - len(header))
+    state.clamp_scroll(log_budget)
+    if state.lines:
+        body = [
+            RenderLine(line, _detail_body_style(line))
+            for line in state.lines[state.scroll_top : state.scroll_top + log_budget]
+        ]
+    else:
+        body = [RenderLine("(no log events)", "subtle")]
+    return [_clip_render_line(line, width) for line in (header + body)[:height]]
 
 
 def render_session_detail_lines(
@@ -1508,26 +1651,16 @@ def render_session_detail_lines(
     exit_label: str = "back",
     exit_keys: tuple[str, ...] = DETAIL_DIRECT_EXIT_KEYS,
 ) -> list[str]:
-    counts = _format_counts(state.entry.status_counts)
-    header = [
-        f"amon detail {state.entry.label}",
-        (
-            f"session={state.entry.session_id} agent={state.entry.agent} "
-            f"project={state.entry.project_display} status={state.entry.status} {counts}"
-        ),
-        (
-            f"tail={'live' if state.tail_enabled else 'static'} "
-            f"follow={'on' if state.follow else 'off'} lines={state.line_count} "
-            f"{_format_detail_exit_keys(exit_keys)} {exit_label}"
-        ),
+    return [
+        line.text
+        for line in render_session_detail_layout(
+            state,
+            width=width,
+            height=height,
+            exit_label=exit_label,
+            exit_keys=exit_keys,
+        )
     ]
-    log_budget = max(1, height - len(header))
-    state.clamp_scroll(log_budget)
-    if state.lines:
-        body = state.lines[state.scroll_top : state.scroll_top + log_budget]
-    else:
-        body = ["(no log events)"]
-    return [_clip_line(line, width) for line in (header + body)[:height]]
 
 
 def _curses_key_name(key: int) -> Optional[str]:
@@ -1552,15 +1685,94 @@ def _curses_key_name(key: int) -> Optional[str]:
     return None
 
 
-def _draw_session_list(stdscr, state: SessionListState, now: float) -> None:
-    height, width = stdscr.getmaxyx()
-    lines = render_session_list_lines(state, width=max(1, width - 1), height=height, now=now)
-    stdscr.erase()
-    for row, line in enumerate(lines):
+def _init_curses_colors(color: str) -> bool:
+    if color == "never":
+        return False
+    try:
+        if not curses.has_colors():
+            return False
+        curses.start_color()
+        background = -1
         try:
-            stdscr.addnstr(row, 0, line, max(0, width - 1))
+            curses.use_default_colors()
+        except curses.error:
+            background = curses.COLOR_BLACK
+        pairs = {
+            "header": curses.COLOR_CYAN,
+            "subtle": curses.COLOR_WHITE,
+            "failed": curses.COLOR_RED,
+            "running": curses.COLOR_GREEN,
+            "unknown": curses.COLOR_YELLOW,
+            "exited": curses.COLOR_BLUE,
+            "tool": curses.COLOR_CYAN,
+            "warn": curses.COLOR_YELLOW,
+        }
+        for name, foreground in pairs.items():
+            curses.init_pair(TUI_COLOR_PAIRS[name], foreground, background)
+    except curses.error:
+        return False
+    return True
+
+
+def _color_pair_attr(name: Optional[str], color_enabled: bool) -> int:
+    if not color_enabled or not name:
+        return 0
+    pair = TUI_COLOR_PAIRS.get(name)
+    if pair is None:
+        return 0
+    try:
+        return curses.color_pair(pair)
+    except curses.error:
+        return 0
+
+
+def _curses_attr_for_line(line: RenderLine, color_enabled: bool) -> int:
+    style_name = line.status if line.style == "row" else line.style
+    attr = _color_pair_attr(style_name, color_enabled)
+    if line.style == "header":
+        attr |= getattr(curses, "A_BOLD", 0)
+    if line.style in {"subtle", "divider", "exited"}:
+        attr |= getattr(curses, "A_DIM", 0)
+    if line.highlighted:
+        attr |= getattr(curses, "A_BOLD", 0)
+    if line.selected:
+        attr |= getattr(curses, "A_REVERSE", 0)
+    return attr
+
+
+def _safe_addnstr(stdscr, row: int, column: int, line: str, width: int, attr: int = 0) -> None:
+    try:
+        if attr:
+            stdscr.addnstr(row, column, line, width, attr)
+        else:
+            stdscr.addnstr(row, column, line, width)
+    except TypeError:
+        try:
+            stdscr.addnstr(row, column, line, width)
         except curses.error:
             pass
+    except curses.error:
+        pass
+
+
+def _draw_session_list(
+    stdscr,
+    state: SessionListState,
+    now: float,
+    color_enabled: bool = False,
+) -> None:
+    height, width = stdscr.getmaxyx()
+    lines = render_session_list_layout(state, width=max(1, width - 1), height=height, now=now)
+    stdscr.erase()
+    for row, line in enumerate(lines):
+        _safe_addnstr(
+            stdscr,
+            row,
+            0,
+            line.text,
+            max(0, width - 1),
+            _curses_attr_for_line(line, color_enabled),
+        )
     stdscr.refresh()
 
 
@@ -1570,9 +1782,10 @@ def _draw_session_detail(
     *,
     exit_label: str = "back",
     exit_keys: tuple[str, ...] = DETAIL_DIRECT_EXIT_KEYS,
+    color_enabled: bool = False,
 ) -> int:
     height, width = stdscr.getmaxyx()
-    lines = render_session_detail_lines(
+    lines = render_session_detail_layout(
         state,
         width=max(1, width - 1),
         height=height,
@@ -1581,10 +1794,14 @@ def _draw_session_detail(
     )
     stdscr.erase()
     for row, line in enumerate(lines):
-        try:
-            stdscr.addnstr(row, 0, line, max(0, width - 1))
-        except curses.error:
-            pass
+        _safe_addnstr(
+            stdscr,
+            row,
+            0,
+            line.text,
+            max(0, width - 1),
+            _curses_attr_for_line(line, color_enabled),
+        )
     stdscr.refresh()
     return max(1, height - 3)
 
@@ -1599,14 +1816,16 @@ def _run_session_detail_tui(
     exit_on_end: bool = False,
     pid_alive_func=None,
     poll_interval: float = 1.0,
+    color: str = "auto",
 ) -> int:
     try:
         curses.curs_set(0)
     except curses.error:
         pass
+    color_enabled = _init_curses_colors(color)
     stdscr.timeout(100)
 
-    state = SessionDetailState(entry, line_count=line_count)
+    state = SessionDetailState(entry, line_count=line_count, color="never")
     next_poll = 0.0
 
     try:
@@ -1625,6 +1844,7 @@ def _run_session_detail_tui(
                 state,
                 exit_label=exit_label,
                 exit_keys=exit_keys,
+                color_enabled=color_enabled,
             )
             key = _curses_key_name(stdscr.getch())
             if (
@@ -1650,11 +1870,13 @@ def _run_sessions_tui(
     *,
     line_count: int = DEFAULT_DETAIL_LINES,
     poll_interval: float = 1.0,
+    color: str = "auto",
 ) -> int:
     try:
         curses.curs_set(0)
     except curses.error:
         pass
+    color_enabled = _init_curses_colors(color)
     stdscr.timeout(100)
 
     state = SessionListState(scope=scope, cwd=cwd)
@@ -1668,7 +1890,7 @@ def _run_sessions_tui(
                 state.merge_discovered(sessions, now)
                 next_poll = now + poll_interval
 
-            _draw_session_list(stdscr, state, now)
+            _draw_session_list(stdscr, state, now, color_enabled=color_enabled)
             key = _curses_key_name(stdscr.getch())
             if key:
                 action = handle_session_list_key(state, key)
@@ -1685,6 +1907,7 @@ def _run_sessions_tui(
                             exit_label="back",
                             exit_keys=DETAIL_LIST_DETAIL_EXIT_KEYS,
                             poll_interval=poll_interval,
+                            color=color,
                         )
     except KeyboardInterrupt:
         return 0
@@ -1728,6 +1951,7 @@ def run_sessions_mode(
     scope: str = SCOPE_ALL,
     cwd: Optional[str] = None,
     lines: int = DEFAULT_DETAIL_LINES,
+    color: str = "auto",
     *,
     output=None,
     error=None,
@@ -1750,6 +1974,7 @@ def run_sessions_mode(
             scope=scope,
             cwd=cwd,
             line_count=lines,
+            color=color,
         )
     )
 
@@ -1757,12 +1982,13 @@ def run_sessions_mode(
 def run_session_detail(
     entry: SessionEntry,
     lines: int = DEFAULT_DETAIL_LINES,
+    color: str = "auto",
     *,
     output=None,
 ) -> int:
     stream = output or sys.stdout
     if output is not None or not stream.isatty():
-        state = SessionDetailState(entry, line_count=lines)
+        state = SessionDetailState(entry, line_count=lines, color=color)
         for line in render_session_detail_lines(state):
             print(line, file=stream)
         return 0
@@ -1774,6 +2000,7 @@ def run_session_detail(
             line_count=lines,
             exit_label="quit",
             exit_on_end=True,
+            color=color,
         )
     )
 
@@ -1782,6 +2009,7 @@ def run_session_detail_path(
     session_path: str,
     agent: str,
     lines: int = DEFAULT_DETAIL_LINES,
+    color: str = "auto",
     *,
     output=None,
     error=None,
@@ -1795,7 +2023,7 @@ def run_session_detail_path(
     if active_session is None and entry.status == "unknown":
         entry.status = "exited"
         entry.status_counts = _single_status_counts("exited")
-    return run_session_detail(entry, lines=lines, output=output)
+    return run_session_detail(entry, lines=lines, color=color, output=output)
 
 
 def infer_agent_from_path(path: str) -> str:
@@ -1868,7 +2096,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--color",
         choices=("always", "never", "auto"),
         default=None,
-        help="color policy for single-session output (default: never)",
+        help="color policy for TUI and direct tail output; --once snapshots stay plain",
     )
     parser.add_argument("--session-path", help=argparse.SUPPRESS)
     parser.add_argument("--session-spec", help=argparse.SUPPRESS)
@@ -1916,7 +2144,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             scope=scope,
         )
 
-    color = args.color or "never"
+    tui_color = args.color or "auto"
+    tail_color = args.color or "never"
     pid = args.pid
     use_detail_view = False
     if targets:
@@ -1936,6 +2165,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             codex_all=args.codex_all_sessions,
             scope=scope,
             lines=args.lines,
+            color=tui_color,
         )
     elif args.session_spec:
         try:
@@ -1968,13 +2198,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             agent,
             sid_short,
             args.idle_threshold,
-            color=color,
+            color="never",
             pid=pid,
             process_state=process_state,
         )
 
     if use_detail_view:
-        return run_session_detail_path(session_path, agent, lines=args.lines)
+        return run_session_detail_path(session_path, agent, lines=args.lines, color=tui_color)
 
     if not Path(session_path).exists():
         print(f"amon: session path missing: {session_path}", file=sys.stderr)
@@ -1982,7 +2212,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if pid is None:
         pid = resolve_session_pid(session_path, agent)
         if pid is None:
-            print(_format_exit_line(agent, sid_short, color))
+            print(_format_exit_line(agent, sid_short, tail_color))
             return 0
     return run_tail(
         session_path,
@@ -1990,7 +2220,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         sid_short,
         args.idle_threshold,
         pid=pid,
-        color=color,
+        color=tail_color,
     )
 
 
