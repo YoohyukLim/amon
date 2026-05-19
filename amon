@@ -30,23 +30,34 @@ UUID_RE = re.compile(
 SCOPE_ALL = "all"
 SCOPE_CURRENT = "current"
 SESSION_STATUSES = ("failed", "running", "unknown", "exited")
+STATUS_COUNT_DISPLAY_ORDER = ("running", "failed", "unknown", "exited")
 STATUS_PRIORITY = {"failed": 3, "running": 2, "unknown": 1, "exited": 0}
 UNICODE_STATUS_ICON_FRAMES = {
     "failed": ("●",),
-    "running": ("✦", "✧", "✶", "✧"),
+    "running": ("✧", "✦", "✶", "✦", "✧"),
     "unknown": ("?",),
     "exited": ("○",),
 }
 ASCII_STATUS_ICON_FRAMES = {
     "failed": ("!",),
-    "running": ("*", "+", "x", "+"),
+    "running": (".", "*", "X", "*", "."),
     "unknown": ("?",),
     "exited": ("o",),
 }
-STATUS_ICONS = {
-    status: frames[0] for status, frames in UNICODE_STATUS_ICON_FRAMES.items()
+UNICODE_STATIC_STATUS_ICONS = {
+    "failed": "●",
+    "running": "●",
+    "unknown": "?",
+    "exited": "○",
 }
-STATUS_ICON_FRAME_SECONDS = 0.5
+ASCII_STATIC_STATUS_ICONS = {
+    "failed": "!",
+    "running": "*",
+    "unknown": "?",
+    "exited": "o",
+}
+STATUS_ICONS = dict(UNICODE_STATIC_STATUS_ICONS)
+STATUS_ICON_FRAME_SECONDS = 0.25
 LIST_STATUS_GROUPS = (
     ("running", "Running"),
     ("failed", "Failed"),
@@ -150,12 +161,14 @@ class RenderLine:
         status: Optional[str] = None,
         selected: bool = False,
         highlighted: bool = False,
+        segments: Optional[list[tuple[str, str]]] = None,
     ):
         self.text = text
         self.style = style
         self.status = status
         self.selected = selected
         self.highlighted = highlighted
+        self.segments = segments
 
 
 def cwd_to_claude_slug(cwd: str) -> str:
@@ -1546,12 +1559,14 @@ def _clip_line(line: str, width: int) -> str:
 
 
 def _clip_render_line(item: RenderLine, width: int) -> RenderLine:
+    clipped = _clip_line(item.text, width)
     return RenderLine(
-        _clip_line(item.text, width),
+        clipped,
         item.style,
         status=item.status,
         selected=item.selected,
         highlighted=item.highlighted,
+        segments=item.segments if clipped == item.text else None,
     )
 
 
@@ -1562,7 +1577,10 @@ def _scope_project_label(scope: str, cwd: Optional[str]) -> str:
 
 
 def _format_counts(counts: dict[str, int]) -> str:
-    return " ".join(f"{status}={counts.get(status, 0)}" for status in SESSION_STATUSES)
+    return " ".join(
+        f"{status}={counts.get(status, 0)}"
+        for status in STATUS_COUNT_DISPLAY_ORDER
+    )
 
 
 def _format_detail_exit_keys(exit_keys: tuple[str, ...]) -> str:
@@ -1678,6 +1696,17 @@ def _status_icon(
     return fallback_frames[_status_icon_frame_index(now) % len(fallback_frames)]
 
 
+def _static_status_icon(status: str, *, unicode_icons: Optional[bool] = None) -> str:
+    use_unicode = _use_unicode_status_icons() if unicode_icons is None else unicode_icons
+    icons = UNICODE_STATIC_STATUS_ICONS if use_unicode else ASCII_STATIC_STATUS_ICONS
+    icon = icons.get(status, icons["unknown"])
+    if _display_width(icon) == 1:
+        return icon
+
+    fallback_icons = ASCII_STATIC_STATUS_ICONS
+    return fallback_icons.get(status, fallback_icons["unknown"])
+
+
 def _session_activity_label(activity_mtime: Optional[float], wall_now: float) -> str:
     if activity_mtime is None:
         return "-"
@@ -1696,9 +1725,18 @@ def _session_activity_label(activity_mtime: Optional[float], wall_now: float) ->
 
 def _session_counts_label(counts: dict[str, int], now: float) -> str:
     return " ".join(
-        f"{_status_icon(status, now)}{counts.get(status, 0)}"
-        for status in SESSION_STATUSES
+        f"{_static_status_icon(status)}{counts.get(status, 0)}"
+        for status in STATUS_COUNT_DISPLAY_ORDER
     )
+
+
+def _session_counts_segments(counts: dict[str, int]) -> list[tuple[str, str]]:
+    segments: list[tuple[str, str]] = []
+    for index, status in enumerate(STATUS_COUNT_DISPLAY_ORDER):
+        if index:
+            segments.append((" ", "header"))
+        segments.append((f"{_static_status_icon(status)}{counts.get(status, 0)}", status))
+    return segments
 
 
 def _session_status_label(status: str, now: float) -> str:
@@ -2047,10 +2085,16 @@ def render_session_list_layout(
     hidden = len(state.hidden_session_ids)
     search = f"/{state.query}" if state.query else "-"
     layout = _list_column_layout(width)
+    header_prefix = f"amon sessions total={total} "
+    header_counts = _session_counts_label(counts, current)
     lines = [
         RenderLine(
-            f"amon sessions total={total} {_session_counts_label(counts, current)}",
+            f"{header_prefix}{header_counts}",
             "header",
+            segments=[
+                (header_prefix, "header"),
+                *_session_counts_segments(counts),
+            ],
         ),
         RenderLine(
             f"scope={state.scope} project={_scope_project_label(state.scope, state.cwd)} "
@@ -2258,7 +2302,7 @@ def _color_pair_attr(name: Optional[str], color_enabled: bool) -> int:
 
 
 def _curses_attr_for_line(line: RenderLine, color_enabled: bool) -> int:
-    style_name = line.status if line.style == "row" else line.style
+    style_name = line.status if line.status and line.style in {"row", "subtle"} else line.style
     attr = _color_pair_attr(style_name, color_enabled)
     if line.style in {"subtle", "divider", "exited"}:
         attr |= getattr(curses, "A_DIM", 0)
@@ -2284,6 +2328,39 @@ def _safe_addnstr(stdscr, row: int, column: int, line: str, width: int, attr: in
         pass
 
 
+def _draw_render_line(
+    stdscr,
+    row: int,
+    line: RenderLine,
+    width: int,
+    color_enabled: bool,
+) -> None:
+    if not line.segments:
+        _safe_addnstr(
+            stdscr,
+            row,
+            0,
+            line.text,
+            width,
+            _curses_attr_for_line(line, color_enabled),
+        )
+        return
+
+    column = 0
+    for segment_text, style_name in line.segments:
+        if column >= width:
+            break
+        _safe_addnstr(
+            stdscr,
+            row,
+            column,
+            segment_text,
+            max(0, width - column),
+            _color_pair_attr(style_name, color_enabled),
+        )
+        column += _display_width(segment_text)
+
+
 def _draw_session_list(
     stdscr,
     state: SessionListState,
@@ -2294,13 +2371,12 @@ def _draw_session_list(
     lines = render_session_list_layout(state, width=max(1, width - 1), height=height, now=now)
     stdscr.erase()
     for row, line in enumerate(lines):
-        _safe_addnstr(
+        _draw_render_line(
             stdscr,
             row,
-            0,
-            line.text,
+            line,
             max(0, width - 1),
-            _curses_attr_for_line(line, color_enabled),
+            color_enabled,
         )
     stdscr.refresh()
 
@@ -2323,13 +2399,12 @@ def _draw_session_detail(
     )
     stdscr.erase()
     for row, line in enumerate(lines):
-        _safe_addnstr(
+        _draw_render_line(
             stdscr,
             row,
-            0,
-            line.text,
+            line,
             max(0, width - 1),
-            _curses_attr_for_line(line, color_enabled),
+            color_enabled,
         )
     stdscr.refresh()
     return max(1, height - 3)
