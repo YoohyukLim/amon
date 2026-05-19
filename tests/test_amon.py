@@ -2050,7 +2050,7 @@ class TestSessionListState(unittest.TestCase):
             [("●1", "running"), ("●1", "failed"), ("?0", "unknown"), ("○0", "exited")],
         )
 
-    def test_session_list_row_count_segments_use_complement_style_order(self):
+    def test_session_list_row_count_segments_use_status_style_order(self):
         state = amon.SessionListState()
         state.entries["mixed"] = amon.SessionEntry(
             session_id="mixed",
@@ -2076,7 +2076,7 @@ class TestSessionListState(unittest.TestCase):
         count_segments = [
             (text, style)
             for text, style in row.segments or []
-            if style in amon.ROW_COUNT_STYLE_BY_STATUS.values()
+            if style in amon.STATUS_COUNT_DISPLAY_ORDER
         ]
         self.assertEqual(row.status, "running")
         self.assertEqual(amon._segments_text(row.segments), row.text)
@@ -2084,10 +2084,10 @@ class TestSessionListState(unittest.TestCase):
         self.assertEqual(
             count_segments,
             [
-                ("●1", "count_running"),
-                ("●2", "count_failed"),
-                ("?3", "count_unknown"),
-                ("○4", "count_exited"),
+                ("●1", "running"),
+                ("●2", "failed"),
+                ("?3", "unknown"),
+                ("○4", "exited"),
             ],
         )
 
@@ -2115,11 +2115,52 @@ class TestSessionListState(unittest.TestCase):
             )
 
         self.assertEqual(row.status, "running")
-        self.assertIn(("●5", "count_failed"), row.segments)
-        self.assertNotIn(("●5", "failed"), row.segments)
+        self.assertIn(("●5", "failed"), row.segments)
+        self.assertNotIn(("●5", "count_failed"), row.segments)
         self.assertNotIn(("●5", "running"), row.segments)
 
-    def test_draw_render_line_uses_count_segment_color_with_row_modifiers(self):
+    def test_draw_render_line_uses_count_segment_status_color_without_selection(self):
+        class FakeScreen:
+            def __init__(self):
+                self.calls = []
+
+            def addnstr(self, *args):
+                self.calls.append(args)
+
+        screen = FakeScreen()
+        line = amon.RenderLine(
+            "row ●1 ●2",
+            "row",
+            status="running",
+            segments=[
+                ("row ", "row"),
+                ("●1", "running"),
+                (" ", "row"),
+                ("●2", "failed"),
+            ],
+        )
+        reverse = 1 << 20
+
+        with mock.patch.object(amon.curses, "A_REVERSE", reverse, create=True), \
+            mock.patch.object(amon.curses, "color_pair", side_effect=lambda pair: pair << 8):
+            amon._draw_render_line(screen, 0, line, 80, color_enabled=True)
+
+        attrs_by_text = {args[2]: args[4] for args in screen.calls}
+        self.assertEqual(
+            attrs_by_text["row "],
+            amon.TUI_COLOR_PAIRS["running"] << 8,
+        )
+        self.assertEqual(
+            attrs_by_text["●1"],
+            amon.TUI_COLOR_PAIRS["running"] << 8,
+        )
+        self.assertEqual(
+            attrs_by_text["●2"],
+            amon.TUI_COLOR_PAIRS["failed"] << 8,
+        )
+        self.assertNotEqual(attrs_by_text["row "], attrs_by_text["●2"])
+
+    def test_draw_render_line_uses_row_attr_for_selected_count_segments(self):
         class FakeScreen:
             def __init__(self):
                 self.calls = []
@@ -2133,33 +2174,31 @@ class TestSessionListState(unittest.TestCase):
             "row",
             status="running",
             selected=True,
+            highlighted=True,
             segments=[
                 ("row ", "row"),
-                ("●1", "count_running"),
+                ("●1", "running"),
                 (" ", "row"),
-                ("●2", "count_failed"),
+                ("●2", "failed"),
             ],
         )
         reverse = 1 << 20
+        underline = 1 << 21
 
         with mock.patch.object(amon.curses, "A_REVERSE", reverse, create=True), \
+            mock.patch.object(amon.curses, "A_UNDERLINE", underline, create=True), \
             mock.patch.object(amon.curses, "color_pair", side_effect=lambda pair: pair << 8):
             amon._draw_render_line(screen, 0, line, 80, color_enabled=True)
 
         attrs_by_text = {args[2]: args[4] for args in screen.calls}
-        self.assertEqual(
-            attrs_by_text["row "],
-            (amon.TUI_COLOR_PAIRS["running"] << 8) | reverse,
-        )
-        self.assertEqual(
-            attrs_by_text["●1"],
-            (amon.TUI_COLOR_PAIRS["count_running"] << 8) | reverse,
-        )
-        self.assertEqual(
+        row_attr = (amon.TUI_COLOR_PAIRS["running"] << 8) | reverse | underline
+        self.assertEqual(attrs_by_text["row "], row_attr)
+        self.assertEqual(attrs_by_text["●1"], row_attr)
+        self.assertEqual(attrs_by_text["●2"], row_attr)
+        self.assertNotEqual(
             attrs_by_text["●2"],
-            (amon.TUI_COLOR_PAIRS["count_failed"] << 8) | reverse,
+            (amon.TUI_COLOR_PAIRS["failed"] << 8) | reverse | underline,
         )
-        self.assertNotEqual(attrs_by_text["row "], attrs_by_text["●1"])
 
     def test_draw_render_line_keeps_segment_output_plain_without_colors(self):
         class FakeScreen:
@@ -2174,7 +2213,7 @@ class TestSessionListState(unittest.TestCase):
             "row ●1",
             "row",
             status="running",
-            segments=[("row ", "row"), ("●1", "count_failed")],
+            segments=[("row ", "row"), ("●1", "failed")],
         )
 
         amon._draw_render_line(screen, 0, line, 80, color_enabled=False)
@@ -2370,19 +2409,10 @@ class TestSessionListState(unittest.TestCase):
             self.assertTrue(amon._init_curses_colors("auto"))
 
         running_color = amon.TUI_MUTED_COLOR_BASE + list(amon.TUI_MUTED_RGB).index("running")
-        count_failed_color = (
-            amon.TUI_MUTED_COLOR_BASE + list(amon.TUI_MUTED_RGB).index("count_failed")
-        )
         init_color.assert_any_call(running_color, *amon.TUI_MUTED_RGB["running"])
-        init_color.assert_any_call(count_failed_color, *amon.TUI_MUTED_RGB["count_failed"])
         init_pair.assert_any_call(
             amon.TUI_COLOR_PAIRS["running"],
             running_color,
-            -1,
-        )
-        init_pair.assert_any_call(
-            amon.TUI_COLOR_PAIRS["count_failed"],
-            count_failed_color,
             -1,
         )
 
@@ -2399,11 +2429,6 @@ class TestSessionListState(unittest.TestCase):
         init_pair.assert_any_call(
             amon.TUI_COLOR_PAIRS["running"],
             amon.TUI_BASIC_COLOR_FALLBACKS["running"],
-            -1,
-        )
-        init_pair.assert_any_call(
-            amon.TUI_COLOR_PAIRS["count_running"],
-            amon.TUI_BASIC_COLOR_FALLBACKS["count_running"],
             -1,
         )
 

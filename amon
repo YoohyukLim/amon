@@ -31,12 +31,6 @@ SCOPE_ALL = "all"
 SCOPE_CURRENT = "current"
 SESSION_STATUSES = ("failed", "running", "unknown", "exited")
 STATUS_COUNT_DISPLAY_ORDER = ("running", "failed", "unknown", "exited")
-ROW_COUNT_STYLE_BY_STATUS = {
-    "running": "count_running",
-    "failed": "count_failed",
-    "unknown": "count_unknown",
-    "exited": "count_exited",
-}
 STATUS_PRIORITY = {"failed": 3, "running": 2, "unknown": 1, "exited": 0}
 UNICODE_STATUS_ICON_FRAMES = {
     "failed": ("●",),
@@ -83,10 +77,6 @@ TUI_COLOR_PAIRS = {
     "exited": 6,
     "tool": 7,
     "warn": 8,
-    "count_running": 9,
-    "count_failed": 10,
-    "count_unknown": 11,
-    "count_exited": 12,
 }
 TUI_MUTED_COLOR_BASE = 16
 TUI_MUTED_RGB = {
@@ -98,10 +88,6 @@ TUI_MUTED_RGB = {
     "exited": (520, 620, 560),
     "tool": (500, 680, 710),
     "warn": (720, 590, 390),
-    "count_running": (700, 560, 720),
-    "count_failed": (520, 700, 720),
-    "count_unknown": (520, 590, 760),
-    "count_exited": (700, 540, 610),
 }
 TUI_BASIC_COLOR_FALLBACKS = {
     "header": curses.COLOR_CYAN,
@@ -112,10 +98,6 @@ TUI_BASIC_COLOR_FALLBACKS = {
     "exited": curses.COLOR_WHITE,
     "tool": curses.COLOR_CYAN,
     "warn": curses.COLOR_YELLOW,
-    "count_running": curses.COLOR_MAGENTA,
-    "count_failed": curses.COLOR_CYAN,
-    "count_unknown": curses.COLOR_BLUE,
-    "count_exited": curses.COLOR_RED,
 }
 
 
@@ -1967,7 +1949,6 @@ def _format_session_list_row(
     count_segments = _session_counts_segments(
         entry.status_counts,
         separator_style="row",
-        style_by_status=ROW_COUNT_STYLE_BY_STATUS,
     )
     line_segments = _format_session_list_column_segments(
         selected=">" if selected else " ",
@@ -2463,6 +2444,10 @@ def _curses_color_name_for_segment(line: RenderLine, style_name: str) -> str:
     return style_name
 
 
+def _is_row_count_segment(line: RenderLine, style_name: str) -> bool:
+    return line.style == "row" and style_name in SESSION_STATUSES
+
+
 def _curses_attr_for_line(line: RenderLine, color_enabled: bool) -> int:
     return _color_pair_attr(
         _curses_color_name_for_line(line),
@@ -2475,6 +2460,8 @@ def _curses_attr_for_segment(
     style_name: str,
     color_enabled: bool,
 ) -> int:
+    if line.selected and _is_row_count_segment(line, style_name):
+        return _curses_attr_for_line(line, color_enabled)
     return _color_pair_attr(
         _curses_color_name_for_segment(line, style_name),
         color_enabled,
