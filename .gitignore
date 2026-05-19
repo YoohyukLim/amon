@@ -1,3 +1,4 @@
 .cairn/
 .claude/state/
 .worktrees/
+__pycache__/

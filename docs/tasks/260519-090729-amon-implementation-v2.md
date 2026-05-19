@@ -30,8 +30,8 @@ must be corrected before implementation:
 
 ## Current Environment Notes
 
-- Python is available as `/opt/homebrew/bin/python3`; observed version:
-  `Python 3.14.5`.
+- Python is available as `python3`; observed version in the implementation
+  worktree: `Python 3.13.0`.
 - `lsof` is available at `/usr/sbin/lsof`.
 - `pgrep` is available at `/usr/bin/pgrep`.
 - `xpanes` is available at `/opt/homebrew/bin/xpanes`.
@@ -220,7 +220,8 @@ Functions to add:
 
 Test coverage:
 
-- script imports cleanly through `importlib.util.spec_from_file_location`;
+- script imports cleanly through `SourceFileLoader`, because `amon` is an
+  extensionless executable script;
 - `main([])` style parsing is possible by allowing an optional argv parameter;
 - `./amon --help` works once argparse is added later.
 

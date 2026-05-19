@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""Monitor Claude and Codex session JSONL activity."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import signal
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+
+
+UUID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
+
+
+def cwd_to_claude_slug(cwd: str) -> str:
+    return "".join("-" if char in "/." else char for char in cwd)
+
+
+def parse_lsof_cwd(output: str) -> Optional[str]:
+    for line in output.splitlines():
+        parts = line.split(None, 8)
+        if len(parts) >= 9 and parts[3] == "cwd":
+            return parts[8]
+    return None
+
+
+def pick_latest_jsonl(directory: str) -> Optional[str]:
+    root = Path(directory)
+    if not root.is_dir():
+        return None
+    paths = [path for path in root.iterdir() if path.is_file() and path.suffix == ".jsonl"]
+    if not paths:
+        return None
+    return str(max(paths, key=lambda path: (path.stat().st_mtime, str(path))))
+
+
+def _run_lsof(pid: int) -> str:
+    proc = subprocess.run(
+        ["lsof", "-p", str(pid)],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return proc.stdout
+
+
+def resolve_claude_session_path(pid: int) -> Optional[str]:
+    cwd = parse_lsof_cwd(_run_lsof(pid))
+    if not cwd:
+        return None
+    directory = Path.home() / ".claude" / "projects" / cwd_to_claude_slug(cwd)
+    return pick_latest_jsonl(str(directory))
+
+
+def parse_lsof_codex_jsonls(output: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        parts = line.split(None, 8)
+        if len(parts) < 9:
+            continue
+        path = parts[8]
+        if path.endswith(".jsonl") and "/.codex/sessions/" in path and path not in seen:
+            paths.append(path)
+            seen.add(path)
+    return paths
+
+
+def resolve_codex_session_paths(pid: int, all_sessions: bool = False) -> list[str]:
+    existing = [path for path in parse_lsof_codex_jsonls(_run_lsof(pid)) if Path(path).exists()]
+    if all_sessions:
+        return existing
+    if not existing:
+        return []
+    newest = max(existing, key=lambda path: (Path(path).stat().st_mtime, path))
+    return [newest]
+
+
+def resolve_path_from_session_id(sid: str) -> Optional[str]:
+    if not sid:
+        return None
+
+    home = Path.home()
+    claude_matches = [
+        path
+        for path in (home / ".claude" / "projects").glob("**/*.jsonl")
+        if path.stem == sid
+    ]
+    if claude_matches:
+        return str(max(claude_matches, key=lambda path: (path.stat().st_mtime, str(path))))
+
+    codex_matches = [
+        path
+        for path in (home / ".codex" / "sessions").glob("**/*.jsonl")
+        if sid in path.stem
+    ]
+    if codex_matches:
+        return str(max(codex_matches, key=lambda path: (path.stat().st_mtime, str(path))))
+    return None
+
+
+def _truncate(text: str, n: int = 80) -> str:
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) <= n:
+        return collapsed
+    if n <= 3:
+        return collapsed[:n]
+    return collapsed[: n - 3] + "..."
+
+
+def _tool_detail(data: object) -> str:
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            return _truncate(data)
+    if not isinstance(data, dict):
+        return ""
+
+    for key in ("command", "cmd", "file_path", "path"):
+        value = data.get(key)
+        if value:
+            return _truncate(str(value))
+    for key in ("description", "query", "url", "workdir"):
+        value = data.get(key)
+        if value:
+            return _truncate(str(value))
+    return ""
+
+
+def _format_claude_event(ev: dict) -> Optional[tuple[str, str]]:
+    if ev.get("type") == "assistant":
+        message = ev.get("message") if isinstance(ev.get("message"), dict) else {}
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "tool_use":
+                name = str(item.get("name") or "tool")
+                detail = _tool_detail(item.get("input"))
+                return ("Tool", _truncate(f"{name} {detail}".strip()))
+            if item.get("type") == "text" and item.get("text"):
+                return ("Msg", _truncate(str(item["text"])))
+        return None
+
+    attachment = ev.get("attachment")
+    if ev.get("type") == "attachment" and isinstance(attachment, dict):
+        if attachment.get("type") == "tool_use":
+            name = str(attachment.get("tool_name") or attachment.get("name") or "tool")
+            detail = _tool_detail(attachment.get("input"))
+            return ("Tool", _truncate(f"{name} {detail}".strip()))
+    return None
+
+
+def _format_codex_event(ev: dict) -> Optional[tuple[str, str]]:
+    if ev.get("type") != "response_item":
+        return None
+    payload = ev.get("payload") or ev.get("item")
+    if not isinstance(payload, dict):
+        return None
+
+    payload_type = payload.get("type")
+    if payload_type == "function_call":
+        name = str(payload.get("name") or "tool")
+        detail = _tool_detail(payload.get("arguments"))
+        return ("Tool", _truncate(f"{name} {detail}".strip()))
+
+    if payload_type == "message" and payload.get("role") == "assistant":
+        content = payload.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "output_text" and item.get("text"):
+                    return ("Msg", _truncate(str(item["text"])))
+        text = payload.get("text")
+        if text:
+            return ("Msg", _truncate(str(text)))
+    return None
+
+
+def _use_color(color: str) -> bool:
+    if color == "always":
+        return True
+    if color == "auto":
+        return sys.stdout.isatty()
+    return False
+
+
+def _colorize(kind: str, text: str, color: str) -> str:
+    if not _use_color(color):
+        return text
+    codes = {
+        "Tool": "36",
+        "WARN": "33",
+        "EXIT": "2",
+    }
+    code = codes.get(kind)
+    if not code:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _format_event_detail(ev: dict, agent: str, color: str = "never") -> Optional[str]:
+    if agent == "claude":
+        formatted = _format_claude_event(ev)
+    elif agent == "codex":
+        formatted = _format_codex_event(ev)
+    else:
+        formatted = None
+    if not formatted:
+        return None
+    kind, detail = formatted
+    return f"{_colorize(kind, kind, color)} {detail}".rstrip()
+
+
+def format_event(ev: dict, agent: str, sid_short: str, color: str = "never") -> Optional[str]:
+    detail = _format_event_detail(ev, agent, color=color)
+    if not detail:
+        return None
+    return f"[{agent}/{sid_short}] {detail}".rstrip()
+
+
+class JsonlTail:
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self.offset = 0
+
+    def read_new_lines(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        size = self.path.stat().st_size
+        if size < self.offset:
+            self.offset = 0
+
+        events: list[dict] = []
+        with self.path.open("r", encoding="utf-8") as handle:
+            handle.seek(self.offset)
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    event = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict):
+                    events.append(event)
+            self.offset = handle.tell()
+        return events
+
+
+class IdleStateMachine:
+    def __init__(self, threshold: float, now: Optional[float] = None):
+        self.threshold = threshold
+        self.last_touch = time.monotonic() if now is None else now
+        self.warned = False
+
+    def touch(self, now: Optional[float] = None) -> None:
+        self.last_touch = time.monotonic() if now is None else now
+        self.warned = False
+
+    def idle_seconds(self, now: Optional[float] = None) -> float:
+        current = time.monotonic() if now is None else now
+        return max(0.0, current - self.last_touch)
+
+    def should_warn(self, now: Optional[float] = None) -> bool:
+        if self.warned:
+            return False
+        if self.idle_seconds(now) >= self.threshold:
+            self.warned = True
+            return True
+        return False
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+_TAIL_STOP = False
+
+
+def _format_idle_line(agent: str, sid_short: str, idle_seconds: float, color: str) -> str:
+    label = _colorize("WARN", "IDLE", color)
+    return f"[{agent}/{sid_short}] {label} idle={int(idle_seconds)}s"
+
+
+def _format_exit_line(agent: str, sid_short: str, color: str) -> str:
+    label = _colorize("EXIT", "AGENT EXITED", color)
+    return f"[{agent}/{sid_short}] {label}"
+
+
+def _install_tail_signal_handlers():
+    if threading.current_thread() is not threading.main_thread():
+        return None
+
+    previous = {}
+
+    def stop_handler(_signum, _frame):
+        global _TAIL_STOP
+        _TAIL_STOP = True
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous[sig] = signal.getsignal(sig)
+        signal.signal(sig, stop_handler)
+    return previous
+
+
+def _restore_tail_signal_handlers(previous) -> None:
+    if not previous:
+        return
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
+
+
+def run_tail(
+    session_path: str,
+    agent: str,
+    sid_short: str,
+    idle_threshold: float,
+    pid: Optional[int] = None,
+    poll_interval: float = 1.0,
+    color: str = "never",
+    *,
+    max_iterations: Optional[int] = None,
+    now_func=None,
+    sleep_func=None,
+    output=None,
+) -> int:
+    global _TAIL_STOP
+    _TAIL_STOP = False
+    now = now_func or time.monotonic
+    sleep = sleep_func or time.sleep
+    stream = output or sys.stdout
+    tail = JsonlTail(session_path)
+    tail.read_new_lines()
+    idle = IdleStateMachine(idle_threshold, now=now())
+    iterations = 0
+    previous_handlers = _install_tail_signal_handlers()
+
+    try:
+        while not _TAIL_STOP:
+            if pid is not None and not _pid_alive(pid):
+                print(_format_exit_line(agent, sid_short, color), file=stream, flush=True)
+                return 0
+
+            printed = False
+            for event in tail.read_new_lines():
+                line = format_event(event, agent, sid_short, color=color)
+                if line:
+                    print(line, file=stream, flush=True)
+                    printed = True
+            if printed:
+                idle.touch(now=now())
+            elif idle.should_warn(now=now()):
+                print(
+                    _format_idle_line(agent, sid_short, idle.idle_seconds(now=now()), color),
+                    file=stream,
+                    flush=True,
+                )
+
+            iterations += 1
+            if max_iterations is not None and iterations >= max_iterations:
+                return 0
+            sleep(poll_interval)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        _restore_tail_signal_handlers(previous_handlers)
+    return 0
+
+
+def snapshot_status(
+    session_path: str,
+    agent: str,
+    sid_short: str,
+    idle_threshold: float,
+    color: str = "never",
+    *,
+    now_func=None,
+) -> tuple[int, str]:
+    path = Path(session_path)
+    if not path.exists():
+        return (1, f"ERROR session path missing: {session_path}")
+
+    last_event = None
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            detail = _format_event_detail(event, agent, color=color)
+            if detail:
+                last_event = detail
+
+    now = time.time() if now_func is None else now_func()
+    idle_seconds = max(0, int(now - path.stat().st_mtime))
+    status = "working" if idle_seconds < idle_threshold else "idle"
+    code = 0 if status == "working" else 2
+    clock = time.strftime("%H:%M:%S", time.localtime(now))
+    last = last_event or "(no events)"
+    return (code, f"{clock} [{agent}/{sid_short}] status={status} idle={idle_seconds}s last={last}")
+
+
+def run_snapshot(
+    session_path: str,
+    agent: str,
+    sid_short: str,
+    idle_threshold: float,
+    color: str = "never",
+    *,
+    now_func=None,
+    output=None,
+    error=None,
+) -> int:
+    code, line = snapshot_status(
+        session_path,
+        agent,
+        sid_short,
+        idle_threshold,
+        color=color,
+        now_func=now_func,
+    )
+    stream = (error or sys.stderr) if code == 1 else (output or sys.stdout)
+    print(line, file=stream)
+    return code
+
+
+def candidate_pids(patterns: list[str]) -> list[int]:
+    pids: list[int] = []
+    seen: set[int] = set()
+    for pattern in patterns:
+        proc = subprocess.run(
+            ["pgrep", "-f", pattern],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        for line in proc.stdout.splitlines():
+            try:
+                pid = int(line.strip())
+            except ValueError:
+                continue
+            if pid not in seen:
+                pids.append(pid)
+                seen.add(pid)
+    return pids
+
+
+def process_command(pid: int) -> str:
+    proc = subprocess.run(
+        ["ps", "-o", "command=", "-p", str(pid)],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return proc.stdout.strip()
+
+
+def _split_cmdline(cmdline: str) -> list[str]:
+    try:
+        return shlex.split(cmdline)
+    except ValueError:
+        return []
+
+
+def is_claude_noninteractive(cmdline: str) -> bool:
+    argv = _split_cmdline(cmdline)
+    for idx, arg in enumerate(argv):
+        if os.path.basename(arg) != "claude":
+            continue
+        args = argv[idx + 1 :]
+        return "-p" in args or "--print" in args
+    return False
+
+
+def is_codex_exec(cmdline: str) -> bool:
+    argv = _split_cmdline(cmdline)
+    return len(argv) >= 2 and os.path.basename(argv[0]) == "codex" and argv[1] == "exec"
+
+
+def discover_active_sessions(codex_all: bool = False) -> list[dict]:
+    sessions: list[dict] = []
+    for pid in candidate_pids(["claude", "codex"]):
+        cmdline = process_command(pid)
+        if is_claude_noninteractive(cmdline):
+            path = resolve_claude_session_path(pid)
+            if path:
+                sessions.append({"agent": "claude", "pid": pid, "path": path})
+            continue
+        if is_codex_exec(cmdline):
+            for path in resolve_codex_session_paths(pid, all_sessions=codex_all):
+                sessions.append({"agent": "codex", "pid": pid, "path": path})
+    return sessions
+
+
+def encode_session_spec(session: dict) -> str:
+    payload = {
+        "agent": session["agent"],
+        "pid": session.get("pid"),
+        "path": session["path"],
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def decode_session_spec(spec: str) -> dict:
+    try:
+        raw = base64.urlsafe_b64decode(spec.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid session spec") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid session spec")
+    if payload.get("agent") not in {"claude", "codex"}:
+        raise ValueError("invalid session agent")
+    if not payload.get("path"):
+        raise ValueError("invalid session path")
+    return payload
+
+
+def session_title(session: dict) -> str:
+    agent = str(session.get("agent") or "session")
+    stem = Path(str(session.get("path") or "")).stem or "session"
+    match = UUID_RE.search(stem)
+    return f"{agent}/{match.group(1) if match else stem}"
+
+
+def run_mode_b(
+    idle_threshold: float,
+    codex_all: bool,
+    color: str = "always",
+    *,
+    output=None,
+    error=None,
+) -> int:
+    err = error or sys.stderr
+    xpanes = shutil.which("xpanes")
+    if not xpanes:
+        print("amon: xpanes is required for multi-session mode", file=err)
+        return 3
+
+    sessions = discover_active_sessions(codex_all=codex_all)
+    if not sessions:
+        print("amon: no active non-interactive sessions found", file=err)
+        return 0
+
+    specs = [encode_session_spec(session) for session in sessions]
+    script = shlex.quote(str(Path(__file__).resolve()))
+    template = (
+        f"printf '\\033]2;%s\\033\\\\' \"$({script} --session-title {{}})\"; "
+        f"exec {script} --session-spec {{}} --idle-threshold {idle_threshold:g} "
+        f"--color={color}"
+    )
+    proc = subprocess.run([xpanes, "-t", "-c", template, *specs], check=False)
+    return proc.returncode
+
+
+def infer_agent_from_path(path: str) -> str:
+    if "/.codex/sessions/" in path:
+        return "codex"
+    return "claude"
+
+
+def short_session_id(path: str) -> str:
+    stem = Path(path).stem
+    return stem[:8] if stem else "session"
+
+
+class AmonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = AmonArgumentParser(
+        prog="amon",
+        description="Monitor active Claude and Codex automation sessions.",
+        epilog=(
+            "Modes:\n"
+            "  amon                         discover active non-interactive sessions and open xpanes\n"
+            "  amon --session-id ID          tail one resolved session\n"
+            "  amon --session-id ID --once   print one snapshot line and exit"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--session-id", help="Claude or Codex session id to monitor")
+    parser.add_argument("--once", action="store_true", help="print one snapshot line and exit")
+    parser.add_argument(
+        "--idle-threshold",
+        type=float,
+        default=60.0,
+        help="seconds without useful activity before the session is idle",
+    )
+    parser.add_argument(
+        "--codex-all-sessions",
+        action="store_true",
+        help="monitor every Codex JSONL held by a discovered codex exec process",
+    )
+    parser.add_argument(
+        "--color",
+        choices=("always", "never", "auto"),
+        default=None,
+        help="color policy for single-session output (default: never)",
+    )
+    parser.add_argument("--session-path", help=argparse.SUPPRESS)
+    parser.add_argument("--session-spec", help=argparse.SUPPRESS)
+    parser.add_argument("--session-title", help=argparse.SUPPRESS)
+    parser.add_argument("--pid", type=int, help=argparse.SUPPRESS)
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.session_title:
+        try:
+            print(session_title(decode_session_spec(args.session_title)))
+        except ValueError as exc:
+            print(f"amon: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if not (args.session_id or args.session_path or args.session_spec):
+        return run_mode_b(
+            args.idle_threshold,
+            codex_all=args.codex_all_sessions,
+            color="always",
+        )
+
+    color = args.color or "never"
+    pid = args.pid
+    if args.session_spec:
+        try:
+            spec = decode_session_spec(args.session_spec)
+        except ValueError as exc:
+            print(f"amon: {exc}", file=sys.stderr)
+            return 1
+        agent = spec["agent"]
+        session_path = spec["path"]
+        pid = spec.get("pid")
+    elif args.session_path:
+        session_path = args.session_path
+        agent = infer_agent_from_path(session_path)
+    else:
+        session_path = resolve_path_from_session_id(args.session_id)
+        if not session_path:
+            print(f"amon: session id not found: {args.session_id}", file=sys.stderr)
+            return 1
+        agent = infer_agent_from_path(session_path)
+
+    sid_short = short_session_id(session_path)
+    if args.once:
+        return run_snapshot(
+            session_path,
+            agent,
+            sid_short,
+            args.idle_threshold,
+            color=color,
+        )
+
+    if not Path(session_path).exists():
+        print(f"amon: session path missing: {session_path}", file=sys.stderr)
+        return 1
+    return run_tail(
+        session_path,
+        agent,
+        sid_short,
+        args.idle_threshold,
+        pid=pid,
+        color=color,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

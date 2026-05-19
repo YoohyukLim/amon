@@ -1,0 +1,4 @@
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done.\nSecond line."}]}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls -la\",\"workdir\":\"/tmp\"}"}}
+{"type":"response_item","payload":{"type":"reasoning","summary":[]}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"ignored output"}}
