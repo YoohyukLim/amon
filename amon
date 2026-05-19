@@ -58,11 +58,15 @@ def _run_lsof(pid: int) -> str:
     return proc.stdout
 
 
-def resolve_claude_session_path(pid: int) -> Optional[str]:
+def resolve_claude_session_path(pid: int, cmdline: str = "") -> Optional[str]:
     cwd = parse_lsof_cwd(_run_lsof(pid))
     if not cwd:
         return None
     directory = Path.home() / ".claude" / "projects" / cwd_to_claude_slug(cwd)
+    session_id = claude_session_id_from_cmdline(cmdline)
+    if session_id:
+        session_path = directory / f"{session_id}.jsonl"
+        return str(session_path) if session_path.is_file() else None
     return pick_latest_jsonl(str(directory))
 
 
@@ -494,6 +498,22 @@ def _split_cmdline(cmdline: str) -> list[str]:
         return []
 
 
+def claude_session_id_from_cmdline(cmdline: str) -> Optional[str]:
+    argv = _split_cmdline(cmdline)
+    for idx, arg in enumerate(argv):
+        if os.path.basename(arg) != "claude":
+            continue
+        args = argv[idx + 1 :]
+        for arg_idx, candidate in enumerate(args):
+            if candidate == "--session-id" and arg_idx + 1 < len(args):
+                return args[arg_idx + 1]
+            if candidate.startswith("--session-id="):
+                session_id = candidate.split("=", 1)[1]
+                return session_id or None
+        return None
+    return None
+
+
 def is_claude_noninteractive(cmdline: str) -> bool:
     argv = _split_cmdline(cmdline)
     for idx, arg in enumerate(argv):
@@ -514,7 +534,7 @@ def discover_active_sessions(codex_all: bool = False) -> list[dict]:
     for pid in candidate_pids(["claude", "codex"]):
         cmdline = process_command(pid)
         if is_claude_noninteractive(cmdline):
-            path = resolve_claude_session_path(pid)
+            path = resolve_claude_session_path(pid, cmdline=cmdline)
             if path:
                 sessions.append({"agent": "claude", "pid": pid, "path": path})
             continue

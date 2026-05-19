@@ -74,5 +74,9 @@ Idle detection is based on useful JSONL activity. Long-running tool calls may
 look idle until the agent writes another useful event, so false positives are
 possible during slow commands.
 
+Claude discovery prefers the `--session-id` in the running process command
+line. If it is unavailable, `amon` falls back to the newest JSONL under the
+process cwd's Claude project directory.
+
 Mode B discovers sessions once when it starts. It does not dynamically add panes
 for sessions that begin later; run `amon` again to pick up new sessions.

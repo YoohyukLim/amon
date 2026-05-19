@@ -174,6 +174,50 @@ class TestPathAndSessionResolution(unittest.TestCase):
                 with mock.patch.object(amon, "_run_lsof", return_value=lsof):
                     self.assertEqual(amon.resolve_claude_session_path(123), str(session))
 
+    def test_resolve_claude_session_path_prefers_cmdline_session_id(self):
+        with tempfile.TemporaryDirectory() as home:
+            session_dir = Path(home) / ".claude" / "projects" / "-tmp-path"
+            session_dir.mkdir(parents=True)
+            selected = session_dir / "11111111-1111-1111-1111-111111111111.jsonl"
+            latest = session_dir / "22222222-2222-2222-2222-222222222222.jsonl"
+            selected.write_text("{}\n", encoding="utf-8")
+            latest.write_text("{}\n", encoding="utf-8")
+            os.utime(selected, (100, 100))
+            os.utime(latest, (200, 200))
+            lsof = (
+                "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+                "python 123 user cwd DIR 1,4 128 999 /tmp/path\n"
+            )
+            cmdline = (
+                "claude --session-id 11111111-1111-1111-1111-111111111111 "
+                "-p hello"
+            )
+            with mock.patch.object(amon.Path, "home", return_value=Path(home)):
+                with mock.patch.object(amon, "_run_lsof", return_value=lsof):
+                    self.assertEqual(
+                        amon.resolve_claude_session_path(123, cmdline=cmdline),
+                        str(selected),
+                    )
+
+    def test_resolve_claude_session_path_does_not_fallback_when_session_id_missing(self):
+        with tempfile.TemporaryDirectory() as home:
+            session_dir = Path(home) / ".claude" / "projects" / "-tmp-path"
+            session_dir.mkdir(parents=True)
+            latest = session_dir / "latest.jsonl"
+            latest.write_text("{}\n", encoding="utf-8")
+            lsof = (
+                "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+                "python 123 user cwd DIR 1,4 128 999 /tmp/path\n"
+            )
+            with mock.patch.object(amon.Path, "home", return_value=Path(home)):
+                with mock.patch.object(amon, "_run_lsof", return_value=lsof):
+                    self.assertIsNone(
+                        amon.resolve_claude_session_path(
+                            123,
+                            cmdline="claude --session-id missing -p hello",
+                        )
+                    )
+
     def test_parse_lsof_codex_jsonls_excludes_logs(self):
         output = "\n".join(
             [
@@ -583,6 +627,17 @@ class TestDiscovery(unittest.TestCase):
         self.assertTrue(amon.is_claude_noninteractive("/opt/bin/claude -p hello"))
         self.assertTrue(amon.is_claude_noninteractive("claude --print hello"))
 
+    def test_claude_session_id_from_cmdline(self):
+        self.assertEqual(
+            amon.claude_session_id_from_cmdline("/opt/bin/claude --session-id abc -p hello"),
+            "abc",
+        )
+        self.assertEqual(
+            amon.claude_session_id_from_cmdline("claude --session-id=def --print hello"),
+            "def",
+        )
+        self.assertIsNone(amon.claude_session_id_from_cmdline("claude -p hello"))
+
     def test_claude_noninteractive_rejects_interactive_and_resume_without_print(self):
         self.assertFalse(amon.is_claude_noninteractive("claude"))
         self.assertFalse(amon.is_claude_noninteractive("claude --resume abc123"))
@@ -602,7 +657,11 @@ class TestDiscovery(unittest.TestCase):
         }
         with mock.patch.object(amon, "candidate_pids", return_value=[1, 2, 3, 4]):
             with mock.patch.object(amon, "process_command", side_effect=lambda pid: commands[pid]):
-                with mock.patch.object(amon, "resolve_claude_session_path", return_value="/tmp/claude.jsonl"):
+                with mock.patch.object(
+                    amon,
+                    "resolve_claude_session_path",
+                    return_value="/tmp/claude.jsonl",
+                ) as claude_resolver:
                     with mock.patch.object(
                         amon,
                         "resolve_codex_session_paths",
@@ -616,6 +675,10 @@ class TestDiscovery(unittest.TestCase):
                 {"agent": "codex", "pid": 3, "path": "/tmp/codex-a.jsonl"},
                 {"agent": "codex", "pid": 3, "path": "/tmp/codex-b.jsonl"},
             ],
+        )
+        claude_resolver.assert_called_once_with(
+            1,
+            cmdline="claude -p hello",
         )
         codex_resolver.assert_called_once_with(3, all_sessions=True)
 
