@@ -804,6 +804,35 @@ class TestRunTail(unittest.TestCase):
 
 
 class TestSessionDetail(unittest.TestCase):
+    class _FakeDetailScreen:
+        def __init__(self, keys=None, on_getch=None):
+            self.keys = list(keys or [])
+            self.on_getch = on_getch
+            self.getch_calls = 0
+
+        def timeout(self, _milliseconds):
+            pass
+
+        def getmaxyx(self):
+            return (10, 120)
+
+        def erase(self):
+            pass
+
+        def addnstr(self, _row, _column, _line, _width):
+            pass
+
+        def refresh(self):
+            pass
+
+        def getch(self):
+            self.getch_calls += 1
+            if self.on_getch is not None:
+                self.on_getch(self.getch_calls)
+            if self.keys:
+                return self.keys.pop(0)
+            return -1
+
     def _write_codex_log(self, root, name, messages):
         path = Path(root) / name
         path.write_text(
@@ -853,6 +882,83 @@ class TestSessionDetail(unittest.TestCase):
         self.assertFalse(amon.should_tail_detail_status("exited"))
         self.assertFalse(amon.should_tail_detail_status("failed"))
 
+    def test_list_detail_back_keys_leave_detail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_codex_log(tmp, "session.jsonl", ["one"])
+            entry = amon.SessionEntry(
+                session_id="session",
+                agent="codex",
+                path=str(path),
+                status="exited",
+                label="Session",
+            )
+            state = amon.SessionDetailState(entry, line_count=1)
+
+            for key in ("q", "BACKSPACE", "ESC"):
+                with self.subTest(key=key):
+                    self.assertEqual(
+                        amon.handle_session_detail_key(
+                            state,
+                            key,
+                            viewport_lines=2,
+                            exit_keys=amon.DETAIL_LIST_DETAIL_EXIT_KEYS,
+                        ),
+                        "quit",
+                    )
+
+    def test_direct_detail_exit_keys_stay_q_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_codex_log(tmp, "session.jsonl", ["one"])
+            entry = amon.SessionEntry(
+                session_id="session",
+                agent="codex",
+                path=str(path),
+                status="exited",
+                label="Session",
+            )
+            state = amon.SessionDetailState(entry, line_count=1)
+
+            self.assertEqual(
+                amon.handle_session_detail_key(state, "q", viewport_lines=2),
+                "quit",
+            )
+            self.assertIsNone(amon.handle_session_detail_key(state, "BACKSPACE", 2))
+            self.assertIsNone(amon.handle_session_detail_key(state, "ESC", 2))
+
+    def test_curses_key_name_normalizes_detail_back_keys(self):
+        self.assertEqual(amon._curses_key_name(27), "ESC")
+        self.assertEqual(amon._curses_key_name(8), "BACKSPACE")
+        self.assertEqual(amon._curses_key_name(127), "BACKSPACE")
+
+    def test_detail_header_names_contextual_exit_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_codex_log(tmp, "session.jsonl", ["one"])
+            entry = amon.SessionEntry(
+                session_id="session",
+                agent="codex",
+                path=str(path),
+                status="exited",
+                label="Session",
+            )
+            state = amon.SessionDetailState(entry, line_count=1)
+
+            list_lines = amon.render_session_detail_lines(
+                state,
+                width=140,
+                height=4,
+                exit_label="back",
+                exit_keys=amon.DETAIL_LIST_DETAIL_EXIT_KEYS,
+            )
+            direct_lines = amon.render_session_detail_lines(
+                state,
+                width=140,
+                height=4,
+                exit_label="quit",
+            )
+
+        self.assertIn("q/Backspace/Esc back", list_lines[2])
+        self.assertIn("q quit", direct_lines[2])
+
     def test_detail_state_follow_pauses_on_scroll_up_and_resumes_at_bottom(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_codex_log(tmp, "session.jsonl", ["one", "two", "three"])
@@ -900,6 +1006,93 @@ class TestSessionDetail(unittest.TestCase):
         self.assertTrue(any("AGENT EXITED" in line for line in state.lines))
         self.assertFalse(state.tail_enabled)
         self.assertEqual(state.entry.status, "exited")
+
+    def test_direct_detail_tui_exits_when_process_ends(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_codex_log(tmp, "session.jsonl", ["old"])
+            entry = amon.SessionEntry(
+                session_id="session",
+                agent="codex",
+                path=str(path),
+                status="running",
+                label="Session",
+                pids=(123,),
+            )
+            screen = self._FakeDetailScreen()
+
+            code = amon._run_session_detail_tui(
+                screen,
+                entry,
+                line_count=1,
+                exit_label="quit",
+                exit_on_end=True,
+                pid_alive_func=lambda _pid: False,
+                poll_interval=0,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(entry.status, "exited")
+        self.assertEqual(entry.pids, ())
+        self.assertEqual(screen.getch_calls, 0)
+
+    def test_direct_detail_tui_exits_when_agent_exit_arrives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_codex_log(tmp, "session.jsonl", ["old"])
+            entry = amon.SessionEntry(
+                session_id="session",
+                agent="codex",
+                path=str(path),
+                status="running",
+                label="Session",
+            )
+
+            def append_exit(call_count):
+                if call_count == 1:
+                    with path.open("a", encoding="utf-8") as handle:
+                        handle.write('{"type":"agent_exit"}\n')
+
+            screen = self._FakeDetailScreen(on_getch=append_exit)
+
+            code = amon._run_session_detail_tui(
+                screen,
+                entry,
+                line_count=1,
+                exit_label="quit",
+                exit_on_end=True,
+                poll_interval=0,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(entry.status, "exited")
+        self.assertEqual(screen.getch_calls, 1)
+
+    def test_list_detail_tui_waits_for_back_key_after_process_ends(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_codex_log(tmp, "session.jsonl", ["old"])
+            entry = amon.SessionEntry(
+                session_id="session",
+                agent="codex",
+                path=str(path),
+                status="running",
+                label="Session",
+                pids=(123,),
+            )
+            screen = self._FakeDetailScreen(keys=[ord("q")])
+
+            code = amon._run_session_detail_tui(
+                screen,
+                entry,
+                line_count=1,
+                exit_label="back",
+                exit_keys=amon.DETAIL_LIST_DETAIL_EXIT_KEYS,
+                exit_on_end=False,
+                pid_alive_func=lambda _pid: False,
+                poll_interval=0,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(entry.status, "running")
+        self.assertEqual(screen.getch_calls, 1)
 
     def test_render_detail_header_includes_identity_status_and_counts(self):
         with tempfile.TemporaryDirectory() as tmp:

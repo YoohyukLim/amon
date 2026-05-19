@@ -32,6 +32,8 @@ STATUS_PRIORITY = {"failed": 3, "running": 2, "unknown": 1, "exited": 0}
 STATUS_ICONS = {"failed": "!", "running": "R", "unknown": "?", "exited": "x"}
 SESSION_HIGHLIGHT_SECONDS = 3.0
 DEFAULT_DETAIL_LINES = 200
+DETAIL_DIRECT_EXIT_KEYS = ("q",)
+DETAIL_LIST_DETAIL_EXIT_KEYS = ("q", "BACKSPACE", "ESC")
 
 
 class LogSummary:
@@ -1316,11 +1318,12 @@ class SessionDetailState:
         self.scroll_top = min(self.max_scroll_top(viewport_lines), self.scroll_top + amount)
         self.clamp_scroll(viewport_lines)
 
-    def poll_tail(self) -> None:
+    def poll_tail(self) -> Optional[str]:
         if self.tail is None or not self.tail_enabled:
-            return
+            return None
 
         appended = False
+        ended_status = None
         for event in self.tail.read_new_lines():
             line = _format_detail_event(event, self.entry.agent, self.sid_short)
             if line:
@@ -1333,10 +1336,32 @@ class SessionDetailState:
                 self.tail_enabled = False
                 self.tail = None
                 self.status_message = "session ended"
+                ended_status = terminal_status
                 break
 
         if appended and self.follow:
             self.scroll_top = self.max_scroll_top(1)
+        return ended_status
+
+    def poll_process_end(self, pid_alive_func=None) -> Optional[str]:
+        if not self.entry.pids or self.entry.status not in {"running", "unknown"}:
+            return None
+        alive = pid_alive_func or _pid_alive
+        if any(alive(pid) for pid in self.entry.pids):
+            return None
+
+        self.entry.status = "exited"
+        self.entry.status_counts = _single_status_counts("exited")
+        self.entry.pids = ()
+        self.tail_enabled = False
+        self.tail = None
+        self.status_message = "process ended"
+        exit_line = _format_exit_line(self.entry.agent, self.sid_short, "never")
+        if not self.lines or self.lines[-1] != exit_line:
+            self.lines.append(exit_line)
+        if self.follow:
+            self.scroll_top = self.max_scroll_top(1)
+        return "exited"
 
 
 def handle_session_list_key(state: SessionListState, key: str) -> Optional[str]:
@@ -1382,8 +1407,10 @@ def handle_session_detail_key(
     state: SessionDetailState,
     key: str,
     viewport_lines: int,
+    *,
+    exit_keys: tuple[str, ...] = DETAIL_DIRECT_EXIT_KEYS,
 ) -> Optional[str]:
-    if key == "q":
+    if key in exit_keys:
         return "quit"
     if key == "UP":
         state.scroll_up(1, viewport_lines)
@@ -1418,6 +1445,11 @@ def _scope_project_label(scope: str, cwd: Optional[str]) -> str:
 
 def _format_counts(counts: dict[str, int]) -> str:
     return " ".join(f"{status}={counts.get(status, 0)}" for status in SESSION_STATUSES)
+
+
+def _format_detail_exit_keys(exit_keys: tuple[str, ...]) -> str:
+    labels = {"BACKSPACE": "Backspace", "ESC": "Esc"}
+    return "/".join(labels.get(key, key) for key in exit_keys)
 
 
 def render_session_list_lines(
@@ -1474,6 +1506,7 @@ def render_session_detail_lines(
     height: int = 24,
     *,
     exit_label: str = "back",
+    exit_keys: tuple[str, ...] = DETAIL_DIRECT_EXIT_KEYS,
 ) -> list[str]:
     counts = _format_counts(state.entry.status_counts)
     header = [
@@ -1485,7 +1518,7 @@ def render_session_detail_lines(
         (
             f"tail={'live' if state.tail_enabled else 'static'} "
             f"follow={'on' if state.follow else 'off'} lines={state.line_count} "
-            f"q {exit_label}"
+            f"{_format_detail_exit_keys(exit_keys)} {exit_label}"
         ),
     ]
     log_budget = max(1, height - len(header))
@@ -1536,6 +1569,7 @@ def _draw_session_detail(
     state: SessionDetailState,
     *,
     exit_label: str = "back",
+    exit_keys: tuple[str, ...] = DETAIL_DIRECT_EXIT_KEYS,
 ) -> int:
     height, width = stdscr.getmaxyx()
     lines = render_session_detail_lines(
@@ -1543,6 +1577,7 @@ def _draw_session_detail(
         width=max(1, width - 1),
         height=height,
         exit_label=exit_label,
+        exit_keys=exit_keys,
     )
     stdscr.erase()
     for row, line in enumerate(lines):
@@ -1560,6 +1595,9 @@ def _run_session_detail_tui(
     *,
     line_count: int,
     exit_label: str = "back",
+    exit_keys: tuple[str, ...] = DETAIL_DIRECT_EXIT_KEYS,
+    exit_on_end: bool = False,
+    pid_alive_func=None,
     poll_interval: float = 1.0,
 ) -> int:
     try:
@@ -1575,12 +1613,30 @@ def _run_session_detail_tui(
         while True:
             now = time.monotonic()
             if now >= next_poll:
-                state.poll_tail()
+                ended_status = state.poll_tail()
+                if ended_status is None and exit_on_end:
+                    ended_status = state.poll_process_end(pid_alive_func=pid_alive_func)
                 next_poll = now + poll_interval
+                if exit_on_end and ended_status:
+                    return 0
 
-            viewport_lines = _draw_session_detail(stdscr, state, exit_label=exit_label)
+            viewport_lines = _draw_session_detail(
+                stdscr,
+                state,
+                exit_label=exit_label,
+                exit_keys=exit_keys,
+            )
             key = _curses_key_name(stdscr.getch())
-            if key and handle_session_detail_key(state, key, viewport_lines) == "quit":
+            if (
+                key
+                and handle_session_detail_key(
+                    state,
+                    key,
+                    viewport_lines,
+                    exit_keys=exit_keys,
+                )
+                == "quit"
+            ):
                 return 0
     except KeyboardInterrupt:
         return 0
@@ -1627,6 +1683,7 @@ def _run_sessions_tui(
                             selected,
                             line_count=line_count,
                             exit_label="back",
+                            exit_keys=DETAIL_LIST_DETAIL_EXIT_KEYS,
                             poll_interval=poll_interval,
                         )
     except KeyboardInterrupt:
@@ -1716,6 +1773,7 @@ def run_session_detail(
             entry,
             line_count=lines,
             exit_label="quit",
+            exit_on_end=True,
         )
     )
 
