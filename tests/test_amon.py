@@ -1673,8 +1673,8 @@ class TestSessionListState(unittest.TestCase):
             lines = amon.render_session_list_lines(state, width=120, height=8, now=11)
             self.assertIn("running=1", lines[0])
             self.assertIn("exited=1", lines[0])
-            self.assertTrue(any("> * | R running | claude | active" in line for line in lines))
-            self.assertTrue(any(line.strip() and set(line.strip()) == {"-"} for line in lines))
+            self.assertTrue(any("> * R running claude active" in line for line in lines))
+            self.assertFalse(any(line.strip() and set(line.strip()) == {"-"} for line in lines))
 
             amon.handle_session_list_key(state, "/")
             amon.handle_session_list_key(state, "a")
@@ -1731,7 +1731,7 @@ class TestSessionListState(unittest.TestCase):
         )
 
         layout = amon.render_session_list_layout(state, width=120, height=6, now=10)
-        row = next(line for line in layout if "| R running |" in line.text)
+        row = next(line for line in layout if line.style == "row" and line.status == "running")
         attr = amon._curses_attr_for_line(row, color_enabled=False)
 
         self.assertEqual(row.style, "row")
@@ -1739,13 +1739,295 @@ class TestSessionListState(unittest.TestCase):
         self.assertTrue(row.selected)
         self.assertTrue(row.highlighted)
         self.assertTrue(attr & amon.curses.A_REVERSE)
-        self.assertTrue(attr & amon.curses.A_BOLD)
+        self.assertTrue(attr & amon.curses.A_UNDERLINE)
+        self.assertFalse(attr & amon.curses.A_BOLD)
+
+    def test_session_list_layout_uses_single_rows_with_aligned_truncating_columns(self):
+        state = amon.SessionListState()
+        state.entries["newer"] = amon.SessionEntry(
+            session_id="newer-session",
+            agent="codex",
+            path="/tmp/newer.jsonl",
+            status="running",
+            label="This is a very long session label that should be clipped",
+            project_display="very-long-project-name",
+            activity_mtime=1240,
+            status_counts={"failed": 0, "running": 1, "unknown": 0, "exited": 0},
+        )
+        state.entries["older"] = amon.SessionEntry(
+            session_id="older-session",
+            agent="claude",
+            path="/tmp/older.jsonl",
+            status="exited",
+            label="Older task",
+            project_display="project-b",
+            activity_mtime=1180,
+            status_counts={"failed": 0, "running": 0, "unknown": 0, "exited": 1},
+        )
+
+        with mock.patch.object(amon.time, "time", return_value=1300):
+            layout = amon.render_session_list_layout(state, width=80, height=8, now=10)
+
+        header = layout[2].text
+        rows = [line.text for line in layout if line.style == "row"]
+        label_col = header.index("label")
+        activity_col = header.index("activity")
+        counts_col = header.index("counts")
+
+        self.assertEqual(len(rows), 2)
+        self.assertFalse(any(line.style == "divider" for line in layout))
+        self.assertTrue(all(len(row) <= 80 for row in rows))
+        self.assertTrue(rows[0][label_col:activity_col].rstrip().endswith("..."))
+        self.assertEqual(rows[0][activity_col:counts_col].strip(), "1m ago")
+        self.assertEqual(rows[1][activity_col:counts_col].strip(), "2m ago")
+        self.assertEqual(rows[0][counts_col:].strip(), "!0 R1 ?0 x0")
+        self.assertEqual(rows[1][counts_col:].strip(), "!0 R0 ?0 x1")
+
+    def test_session_list_layout_groups_statuses_and_uses_status_icons(self):
+        state = amon.SessionListState()
+        state.entries["running-old"] = amon.SessionEntry(
+            session_id="running-old",
+            agent="codex",
+            path="/tmp/running-old.jsonl",
+            status="running",
+            label="Running old",
+            project_display="project-a",
+            activity_mtime=100,
+        )
+        state.entries["running-new"] = amon.SessionEntry(
+            session_id="running-new",
+            agent="codex",
+            path="/tmp/running-new.jsonl",
+            status="running",
+            label="Running new",
+            project_display="project-a",
+            activity_mtime=300,
+        )
+        state.entries["failed"] = amon.SessionEntry(
+            session_id="failed",
+            agent="claude",
+            path="/tmp/failed.jsonl",
+            status="failed",
+            label="Failed task",
+            project_display="project-b",
+            activity_mtime=400,
+        )
+        state.entries["exited"] = amon.SessionEntry(
+            session_id="exited",
+            agent="claude",
+            path="/tmp/exited.jsonl",
+            status="exited",
+            label="Exited task",
+            project_display="project-c",
+            activity_mtime=500,
+        )
+
+        layout = amon.render_session_list_layout(state, width=110, height=20, now=10)
+        section_headers = [
+            line.text
+            for line in layout
+            if line.style == "subtle" and line.text.endswith(")")
+        ]
+        rows = [line.text for line in layout if line.style == "row"]
+        table_header = layout[2].text
+        status_col = table_header.index("status")
+        agent_col = table_header.index("agent")
+
+        self.assertEqual(section_headers, ["Running (2)", "Failed (1)", "Exited (1)"])
+        self.assertNotIn("Unknown (0)", [line.text for line in layout])
+        self.assertEqual([entry.session_id for entry in state.grouped_visible_entries()], [
+            "running-new",
+            "running-old",
+            "failed",
+            "exited",
+        ])
+        self.assertEqual(rows[0][status_col:agent_col].strip(), "R running")
+        self.assertEqual(rows[2][status_col:agent_col].strip(), "! failed")
+        self.assertEqual(rows[3][status_col:agent_col].strip(), "x exited")
+        self.assertFalse(any(line.style == "divider" for line in layout))
+
+    def test_session_list_cursor_moves_across_grouped_rows_not_headers(self):
+        state = amon.SessionListState()
+        state.entries["running"] = amon.SessionEntry(
+            session_id="running",
+            agent="codex",
+            path="/tmp/running.jsonl",
+            status="running",
+            label="Running",
+            activity_mtime=100,
+        )
+        state.entries["failed"] = amon.SessionEntry(
+            session_id="failed",
+            agent="codex",
+            path="/tmp/failed.jsonl",
+            status="failed",
+            label="Failed",
+            activity_mtime=300,
+        )
+        state.entries["exited"] = amon.SessionEntry(
+            session_id="exited",
+            agent="codex",
+            path="/tmp/exited.jsonl",
+            status="exited",
+            label="Exited",
+            activity_mtime=500,
+        )
+
+        self.assertEqual(state.selected_entry().session_id, "running")
+        amon.handle_session_list_key(state, "DOWN")
+        self.assertEqual(state.selected_entry().session_id, "failed")
+        amon.handle_session_list_key(state, "DOWN")
+        self.assertEqual(state.selected_entry().session_id, "exited")
+        amon.handle_session_list_key(state, "DOWN")
+        self.assertEqual(state.selected_entry().session_id, "exited")
+        amon.handle_session_list_key(state, "UP")
+        self.assertEqual(state.selected_entry().session_id, "failed")
+
+        layout = amon.render_session_list_layout(state, width=100, height=12, now=10)
+        selected_rows = [line.text for line in layout if line.style == "row" and line.selected]
+        self.assertEqual(len(selected_rows), 1)
+        self.assertIn("! failed", selected_rows[0])
+
+    def test_session_list_constrained_group_viewport_keeps_headers_with_rows(self):
+        state = amon.SessionListState()
+        state.entries["running-old"] = amon.SessionEntry(
+            session_id="running-old",
+            agent="codex",
+            path="/tmp/running-old.jsonl",
+            status="running",
+            label="Running old",
+            activity_mtime=100,
+        )
+        state.entries["running-new"] = amon.SessionEntry(
+            session_id="running-new",
+            agent="codex",
+            path="/tmp/running-new.jsonl",
+            status="running",
+            label="Running new",
+            activity_mtime=200,
+        )
+        state.entries["failed"] = amon.SessionEntry(
+            session_id="failed",
+            agent="codex",
+            path="/tmp/failed.jsonl",
+            status="failed",
+            label="Failed",
+            activity_mtime=300,
+        )
+        state.entries["exited"] = amon.SessionEntry(
+            session_id="exited",
+            agent="codex",
+            path="/tmp/exited.jsonl",
+            status="exited",
+            label="Exited",
+            activity_mtime=400,
+        )
+        state.cursor = 2
+
+        layout = amon.render_session_list_layout(state, width=100, height=6, now=10)
+        body = layout[3:-1]
+
+        self.assertEqual(len(body), 2)
+        self.assertEqual(body[0].text, "Failed (1)")
+        self.assertEqual(body[0].style, "subtle")
+        self.assertEqual(body[1].style, "row")
+        self.assertEqual(body[1].status, "failed")
+        self.assertTrue(body[1].selected)
+
+    def test_session_list_long_wide_label_does_not_shift_activity_or_counts(self):
+        state = amon.SessionListState()
+        state.entries["wide"] = amon.SessionEntry(
+            session_id="wide",
+            agent="codex",
+            path="/tmp/wide.jsonl",
+            status="running",
+            label="작업" * 40,
+            project_display="project",
+            activity_mtime=1240,
+            status_counts={"failed": 0, "running": 1, "unknown": 0, "exited": 0},
+        )
+
+        with mock.patch.object(amon.time, "time", return_value=1300):
+            layout = amon.render_session_list_layout(state, width=80, height=8, now=10)
+
+        header = layout[2].text
+        row = next(line.text for line in layout if line.style == "row")
+        activity_col = amon._display_width(header[: header.index("activity")])
+        counts_col = amon._display_width(header[: header.index("counts")])
+        row_activity_col = amon._display_width(row[: row.index("1m ago")])
+        row_counts_col = amon._display_width(row[: row.index("!0 R1 ?0 x0")])
+
+        self.assertLessEqual(amon._display_width(row), 80)
+        self.assertIn("...", row[: row.index("1m ago")])
+        self.assertEqual(row_activity_col, activity_col)
+        self.assertEqual(row_counts_col, counts_col)
+
+    def test_session_list_narrow_width_hides_low_priority_columns_and_stays_bounded(self):
+        state = amon.SessionListState()
+        state.entries["narrow"] = amon.SessionEntry(
+            session_id="narrow-session",
+            agent="codex",
+            path="/tmp/narrow.jsonl",
+            status="running",
+            label="A very long label that has to fit",
+            project_display="project",
+            activity_mtime=1240,
+        )
+
+        with mock.patch.object(amon.time, "time", return_value=1300):
+            layout = amon.render_session_list_layout(state, width=30, height=8, now=10)
+
+        table_header = layout[2].text
+        row = next(line.text for line in layout if line.style == "row")
+
+        self.assertTrue(all(amon._display_width(line.text) <= 30 for line in layout))
+        self.assertIn("status", table_header)
+        self.assertIn("label", table_header)
+        self.assertNotIn("activity", table_header)
+        self.assertNotIn("counts", table_header)
+        self.assertNotIn("project", table_header)
+        self.assertNotIn("!0 R1 ?0 x0", row)
+        self.assertFalse(any(line.style == "divider" for line in layout))
 
     def test_curses_attr_uses_status_color_pair_when_enabled(self):
         line = amon.RenderLine("row", "row", status="failed")
         with mock.patch.object(amon.curses, "color_pair", side_effect=lambda pair: pair * 1000):
             attr = amon._curses_attr_for_line(line, color_enabled=True)
         self.assertEqual(attr, amon.TUI_COLOR_PAIRS["failed"] * 1000)
+
+    def test_init_curses_colors_uses_muted_custom_palette_when_supported(self):
+        with mock.patch.object(amon.curses, "has_colors", return_value=True), \
+            mock.patch.object(amon.curses, "start_color"), \
+            mock.patch.object(amon.curses, "use_default_colors"), \
+            mock.patch.object(amon.curses, "can_change_color", return_value=True), \
+            mock.patch.object(amon.curses, "COLORS", 64, create=True), \
+            mock.patch.object(amon.curses, "init_color") as init_color, \
+            mock.patch.object(amon.curses, "init_pair") as init_pair:
+            self.assertTrue(amon._init_curses_colors("auto"))
+
+        running_color = amon.TUI_MUTED_COLOR_BASE + list(amon.TUI_MUTED_RGB).index("running")
+        init_color.assert_any_call(running_color, *amon.TUI_MUTED_RGB["running"])
+        init_pair.assert_any_call(
+            amon.TUI_COLOR_PAIRS["running"],
+            running_color,
+            -1,
+        )
+
+    def test_init_curses_colors_falls_back_to_basic_low_intensity_colors(self):
+        with mock.patch.object(amon.curses, "has_colors", return_value=True), \
+            mock.patch.object(amon.curses, "start_color"), \
+            mock.patch.object(amon.curses, "use_default_colors"), \
+            mock.patch.object(amon.curses, "can_change_color", return_value=False), \
+            mock.patch.object(amon.curses, "init_color") as init_color, \
+            mock.patch.object(amon.curses, "init_pair") as init_pair:
+            self.assertTrue(amon._init_curses_colors("auto"))
+
+        init_color.assert_not_called()
+        init_pair.assert_any_call(
+            amon.TUI_COLOR_PAIRS["running"],
+            amon.TUI_BASIC_COLOR_FALLBACKS["running"],
+            -1,
+        )
 
 
 class TestModeBLauncher(unittest.TestCase):
