@@ -197,6 +197,21 @@ def _format_codex_event(ev: dict) -> Optional[tuple[str, str]]:
     return None
 
 
+def is_agent_exit_event(ev: dict, agent: str) -> bool:
+    if agent == "claude" and ev.get("type") == "result":
+        return True
+
+    event_type = ev.get("type")
+    if event_type in {"agent_exit", "session_exit"}:
+        return True
+
+    payload = ev.get("payload") or ev.get("item")
+    if isinstance(payload, dict) and payload.get("type") in {"agent_exit", "session_exit"}:
+        return True
+
+    return False
+
+
 def _use_color(color: str) -> bool:
     if color == "always":
         return True
@@ -303,6 +318,12 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _process_state(pid: Optional[int]) -> str:
+    if pid is None:
+        return "unknown"
+    return "alive" if _pid_alive(pid) else "exited"
+
+
 _TAIL_STOP = False
 
 
@@ -371,11 +392,18 @@ def run_tail(
                 return 0
 
             printed = False
+            agent_exited = False
             for event in tail.read_new_lines():
+                if is_agent_exit_event(event, agent):
+                    agent_exited = True
+                    continue
                 line = format_event(event, agent, sid_short, color=color)
                 if line:
                     print(line, file=stream, flush=True)
                     printed = True
+            if agent_exited:
+                print(_format_exit_line(agent, sid_short, color), file=stream, flush=True)
+                return 0
             if printed:
                 idle.touch(now=now())
             elif idle.should_warn(now=now()):
@@ -402,6 +430,8 @@ def snapshot_status(
     sid_short: str,
     idle_threshold: float,
     color: str = "never",
+    pid: Optional[int] = None,
+    process_state: Optional[str] = None,
     *,
     now_func=None,
 ) -> tuple[int, str]:
@@ -427,11 +457,27 @@ def snapshot_status(
 
     now = time.time() if now_func is None else now_func()
     idle_seconds = max(0, int(now - path.stat().st_mtime))
-    status = "working" if idle_seconds < idle_threshold else "idle"
-    code = 0 if status == "working" else 2
+    resolved_process_state = process_state or _process_state(pid)
+    if resolved_process_state not in {"alive", "exited", "unknown"}:
+        resolved_process_state = "unknown"
+
+    if resolved_process_state == "exited":
+        status = "exited"
+        code = 4
+    else:
+        status = "working" if idle_seconds < idle_threshold else "idle"
+        code = 0 if status == "working" else 2
+
     clock = time.strftime("%H:%M:%S", time.localtime(now))
     last = last_event or "(no events)"
-    return (code, f"{clock} [{agent}/{sid_short}] status={status} idle={idle_seconds}s last={last}")
+    process = f"process={resolved_process_state}"
+    if pid is not None:
+        process = f"{process} pid={pid}"
+    return (
+        code,
+        f"{clock} [{agent}/{sid_short}] status={status} "
+        f"idle={idle_seconds}s {process} last={last}",
+    )
 
 
 def run_snapshot(
@@ -440,6 +486,8 @@ def run_snapshot(
     sid_short: str,
     idle_threshold: float,
     color: str = "never",
+    pid: Optional[int] = None,
+    process_state: Optional[str] = None,
     *,
     now_func=None,
     output=None,
@@ -451,6 +499,8 @@ def run_snapshot(
         sid_short,
         idle_threshold,
         color=color,
+        pid=pid,
+        process_state=process_state,
         now_func=now_func,
     )
     stream = (error or sys.stderr) if code == 1 else (output or sys.stdout)
@@ -542,6 +592,25 @@ def discover_active_sessions(codex_all: bool = False) -> list[dict]:
             for path in resolve_codex_session_paths(pid, all_sessions=codex_all):
                 sessions.append({"agent": "codex", "pid": pid, "path": path})
     return sessions
+
+
+def _normalized_session_path(path: str) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
+def resolve_session_pid(session_path: str, agent: str) -> Optional[int]:
+    target = _normalized_session_path(session_path)
+    for session in discover_active_sessions(codex_all=True):
+        if session.get("agent") != agent:
+            continue
+        candidate = session.get("path")
+        if not candidate:
+            continue
+        if _normalized_session_path(str(candidate)) != target:
+            continue
+        pid = session.get("pid")
+        return pid if isinstance(pid, int) else None
+    return None
 
 
 def encode_session_spec(session: dict) -> str:
@@ -703,17 +772,28 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     sid_short = short_session_id(session_path)
     if args.once:
+        process_state = None
+        if pid is None and Path(session_path).exists():
+            pid = resolve_session_pid(session_path, agent)
+            process_state = "alive" if pid is not None else "exited"
         return run_snapshot(
             session_path,
             agent,
             sid_short,
             args.idle_threshold,
             color=color,
+            pid=pid,
+            process_state=process_state,
         )
 
     if not Path(session_path).exists():
         print(f"amon: session path missing: {session_path}", file=sys.stderr)
         return 1
+    if pid is None:
+        pid = resolve_session_pid(session_path, agent)
+        if pid is None:
+            print(_format_exit_line(agent, sid_short, color))
+            return 0
     return run_tail(
         session_path,
         agent,

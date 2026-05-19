@@ -157,6 +157,27 @@ class TestCliWiring(unittest.TestCase):
             "session-",
             60.0,
             color="never",
+            pid=None,
+            process_state=None,
+        )
+
+    def test_main_session_path_once_marks_existing_file_exited_without_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".codex" / "sessions" / "session-123456789.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text("{}\n", encoding="utf-8")
+            with mock.patch.object(amon, "resolve_session_pid", return_value=None):
+                with mock.patch.object(amon, "run_snapshot", return_value=4) as snapshot:
+                    code = amon.main(["--session-path", str(path), "--once"])
+        self.assertEqual(code, 4)
+        snapshot.assert_called_once_with(
+            str(path),
+            "codex",
+            "session-",
+            60.0,
+            color="never",
+            pid=None,
+            process_state="exited",
         )
 
     def test_main_session_spec_calls_tail_with_decoded_pid(self):
@@ -174,6 +195,57 @@ class TestCliWiring(unittest.TestCase):
             7.0,
             pid=321,
             color="never",
+        )
+
+    def test_main_session_id_tail_resolves_live_pid(self):
+        with mock.patch.object(
+            amon,
+            "resolve_path_from_session_id",
+            return_value="/tmp/.codex/sessions/run-abcdef.jsonl",
+        ):
+            with mock.patch.object(amon.Path, "exists", return_value=True):
+                with mock.patch.object(amon, "resolve_session_pid", return_value=555):
+                    with mock.patch.object(amon, "run_tail", return_value=0) as tail:
+                        code = amon.main(["--session-id", "abcdef"])
+        self.assertEqual(code, 0)
+        tail.assert_called_once_with(
+            "/tmp/.codex/sessions/run-abcdef.jsonl",
+            "codex",
+            "run-abcd",
+            60.0,
+            pid=555,
+            color="never",
+        )
+
+    def test_main_session_path_tail_exits_when_no_live_process_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".codex" / "sessions" / "session-123456789.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text("{}\n", encoding="utf-8")
+            out = io.StringIO()
+            with mock.patch.object(amon, "resolve_session_pid", return_value=None):
+                with mock.patch.object(amon, "run_tail") as tail:
+                    with mock.patch.object(amon.sys, "stdout", out):
+                        code = amon.main(["--session-path", str(path)])
+        self.assertEqual(code, 0)
+        self.assertIn("AGENT EXITED", out.getvalue())
+        tail.assert_not_called()
+
+    def test_main_session_spec_once_calls_snapshot_with_decoded_pid(self):
+        spec = amon.encode_session_spec(
+            {"agent": "claude", "pid": 321, "path": "/tmp/claude-session.jsonl"}
+        )
+        with mock.patch.object(amon, "run_snapshot", return_value=4) as snapshot:
+            code = amon.main(["--session-spec", spec, "--once"])
+        self.assertEqual(code, 4)
+        snapshot.assert_called_once_with(
+            "/tmp/claude-session.jsonl",
+            "claude",
+            "claude-s",
+            60.0,
+            color="never",
+            pid=321,
+            process_state=None,
         )
 
     def test_main_session_title_prints_runtime_and_session_stem(self):
@@ -205,14 +277,16 @@ class TestCliWiring(unittest.TestCase):
             "resolve_path_from_session_id",
             return_value="/tmp/.codex/sessions/run-abcdef.jsonl",
         ):
-            with mock.patch.object(amon, "run_snapshot", return_value=2) as snapshot:
-                code = amon.main([
-                    "--session-id",
-                    "abcdef",
-                    "--once",
-                    "--color",
-                    "always",
-                ])
+            with mock.patch.object(amon.Path, "exists", return_value=True):
+                with mock.patch.object(amon, "resolve_session_pid", return_value=555):
+                    with mock.patch.object(amon, "run_snapshot", return_value=2) as snapshot:
+                        code = amon.main([
+                            "--session-id",
+                            "abcdef",
+                            "--once",
+                            "--color",
+                            "always",
+                        ])
         self.assertEqual(code, 2)
         snapshot.assert_called_once_with(
             "/tmp/.codex/sessions/run-abcdef.jsonl",
@@ -220,6 +294,8 @@ class TestCliWiring(unittest.TestCase):
             "run-abcd",
             60.0,
             color="always",
+            pid=555,
+            process_state="alive",
         )
 
 
@@ -444,6 +520,17 @@ class TestEventFormatting(unittest.TestCase):
         self.assertNotIn("\033[", plain)
         self.assertIn("\033[", colored)
 
+    def test_agent_exit_event_detection(self):
+        self.assertTrue(amon.is_agent_exit_event({"type": "result"}, "claude"))
+        self.assertTrue(amon.is_agent_exit_event({"type": "agent_exit"}, "codex"))
+        self.assertTrue(
+            amon.is_agent_exit_event(
+                {"type": "event", "payload": {"type": "session_exit"}},
+                "codex",
+            )
+        )
+        self.assertFalse(amon.is_agent_exit_event({"type": "response_item"}, "codex"))
+
 
 class TestJsonlTail(unittest.TestCase):
     def test_initial_read_and_second_read_without_new_data(self):
@@ -584,6 +671,29 @@ class TestRunTail(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("AGENT EXITED", out.getvalue())
 
+    def test_run_tail_exits_when_agent_exit_event_arrives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            path.write_text("", encoding="utf-8")
+            out = io.StringIO()
+
+            def sleep(_seconds):
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write('{"type":"result","subtype":"success"}\n')
+
+            code = amon.run_tail(
+                str(path),
+                "claude",
+                "sid",
+                idle_threshold=99,
+                poll_interval=0,
+                max_iterations=2,
+                sleep_func=sleep,
+                output=out,
+            )
+            self.assertEqual(code, 0)
+            self.assertIn("AGENT EXITED", out.getvalue())
+
 
 class TestSnapshot(unittest.TestCase):
     def test_snapshot_working_status(self):
@@ -600,7 +710,11 @@ class TestSnapshot(unittest.TestCase):
             )
             self.assertEqual(code, 0)
             clock = time.strftime("%H:%M:%S", time.localtime(1000))
-            self.assertIn(f"{clock} [codex/sid] status=working idle=100s last=Tool exec_command ls -la", line)
+            self.assertIn(
+                f"{clock} [codex/sid] status=working idle=100s "
+                "process=unknown last=Tool exec_command ls -la",
+                line,
+            )
 
     def test_snapshot_idle_status(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -616,7 +730,59 @@ class TestSnapshot(unittest.TestCase):
             )
             self.assertEqual(code, 2)
             self.assertIn("status=idle idle=200s", line)
+            self.assertIn("process=unknown", line)
             self.assertIn("last=Tool Read /tmp/example.py", line)
+
+    def test_snapshot_live_process_includes_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            path.write_text((FIXTURES / "codex_session.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+            os.utime(path, (900, 900))
+            with mock.patch.object(amon, "_pid_alive", return_value=True):
+                code, line = amon.snapshot_status(
+                    str(path),
+                    "codex",
+                    "sid",
+                    idle_threshold=200,
+                    pid=123,
+                    now_func=lambda: 1000,
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("status=working idle=100s process=alive pid=123", line)
+
+    def test_snapshot_exited_process_overrides_idle_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            path.write_text((FIXTURES / "codex_session.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+            os.utime(path, (999, 999))
+            with mock.patch.object(amon, "_pid_alive", return_value=False):
+                code, line = amon.snapshot_status(
+                    str(path),
+                    "codex",
+                    "sid",
+                    idle_threshold=200,
+                    pid=123,
+                    now_func=lambda: 1000,
+                )
+            self.assertEqual(code, 4)
+            self.assertIn("status=exited idle=1s process=exited pid=123", line)
+
+    def test_snapshot_exited_process_state_without_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            path.write_text((FIXTURES / "codex_session.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+            os.utime(path, (999, 999))
+            code, line = amon.snapshot_status(
+                str(path),
+                "codex",
+                "sid",
+                idle_threshold=200,
+                process_state="exited",
+                now_func=lambda: 1000,
+            )
+            self.assertEqual(code, 4)
+            self.assertIn("status=exited idle=1s process=exited", line)
+            self.assertNotIn("pid=", line)
 
     def test_snapshot_no_useful_events(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -632,6 +798,7 @@ class TestSnapshot(unittest.TestCase):
             )
             self.assertEqual(code, 0)
             self.assertIn("last=(no events)", line)
+            self.assertIn("process=unknown", line)
 
     def test_snapshot_skips_malformed_before_valid_event(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -770,6 +937,25 @@ class TestDiscovery(unittest.TestCase):
             cmdline="claude -p hello",
         )
         codex_resolver.assert_called_once_with(3, all_sessions=True)
+
+    def test_resolve_session_pid_matches_discovered_path_and_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target.jsonl"
+            other = Path(tmp) / "other.jsonl"
+            target.write_text("{}\n", encoding="utf-8")
+            other.write_text("{}\n", encoding="utf-8")
+            sessions = [
+                {"agent": "claude", "pid": 111, "path": str(target)},
+                {"agent": "codex", "pid": 222, "path": str(other)},
+                {"agent": "codex", "pid": 333, "path": str(target)},
+            ]
+            with mock.patch.object(amon, "discover_active_sessions", return_value=sessions) as discover:
+                self.assertEqual(amon.resolve_session_pid(str(target), "codex"), 333)
+        discover.assert_called_once_with(codex_all=True)
+
+    def test_resolve_session_pid_returns_none_without_live_match(self):
+        with mock.patch.object(amon, "discover_active_sessions", return_value=[]):
+            self.assertIsNone(amon.resolve_session_pid("/tmp/session.jsonl", "codex"))
 
 
 class TestModeBLauncher(unittest.TestCase):

@@ -59,6 +59,9 @@ Print one status line and exit:
 amon --session-id <session-id> --once
 ```
 
+Snapshot output includes `process=alive|exited|unknown`. When a PID is known,
+the line also includes `pid=N`.
+
 Monitor every JSONL currently held by a `codex exec` process instead of only
 the newest per process:
 
@@ -87,12 +90,24 @@ their shell open after a monitor exits so the final output remains visible.
 - `1`: invalid input, unresolved session id, or missing direct session path.
 - `2`: snapshot status is idle.
 - `3`: `xpanes` is required but unavailable for Mode B.
+- `4`: snapshot status is exited because the session process is no longer alive.
 
 ## Notes
 
 Idle detection is based on useful JSONL activity. Long-running tool calls may
 look idle until the agent writes another useful event, so false positives are
 possible during slow commands.
+
+Snapshot status checks process liveness when a PID is supplied or when the
+session JSONL can be matched to a currently discovered active session. If no
+matching process is found, the snapshot reports `status=exited`; without enough
+process information it reports `process=unknown` and falls back to mtime-based
+working/idle status.
+
+Tail mode also checks process liveness. If a resolved session has no matching
+live process at startup, the known process exits while being monitored, or a
+supported agent-exit event appears in the JSONL stream, `amon` prints
+`AGENT EXITED` and exits.
 
 Claude discovery prefers the `--session-id` in the running process command
 line. If it is unavailable, `amon` falls back to the newest JSONL under the
