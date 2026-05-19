@@ -7,7 +7,7 @@
 
 ## 1. Overview
 
-`amon` is an implemented single-file command line monitor for non-interactive Claude and Codex agent sessions. The executable at [`amon`](../../amon) tails JSONL session logs, formats selected assistant/tool activity into compact status lines, detects idle periods, and can launch one monitor pane per active session through `xpanes`.
+`amon` is an implemented single-file command line monitor for non-interactive Claude and Codex agent sessions. The executable at [`amon`](../../amon) tails JSONL session logs, formats selected assistant/tool activity into compact status lines, detects idle and exited sessions, and can launch one monitor pane per active session through `xpanes`.
 
 The public usage contract is summarized in the root [`README.md`](../../README.md). Regression coverage lives in [`tests/test_amon.py`](../../tests/test_amon.py) with Claude and Codex JSONL fixtures in [`claude_session.jsonl`](../../tests/fixtures/claude_session.jsonl) and [`codex_session.jsonl`](../../tests/fixtures/codex_session.jsonl).
 
@@ -18,7 +18,7 @@ The public usage contract is summarized in the root [`README.md`](../../README.m
 | Language | Python 3 stdlib | [`amon`](../../amon) has no runtime package dependency |
 | Packaging | Extensionless executable | User copies or symlinks the file onto `PATH` |
 | Session source | JSONL logs | Claude project logs and Codex session logs use different event shapes |
-| Process discovery | Host commands | Uses `pgrep`, `ps`, and `lsof` from [`amon`](../../amon) |
+| Process discovery / liveness | Host commands + PID probe | Uses `pgrep`, `ps`, `lsof`, and `os.kill(pid, 0)` from [`amon`](../../amon) |
 | Multi-session display | `xpanes` | Required only for Mode B discovery launch |
 | Shell integration | Bash profile function | Managed by [`scripts/install-claude-session-wrapper.sh`](../../scripts/install-claude-session-wrapper.sh) and [`scripts/uninstall-claude-session-wrapper.sh`](../../scripts/uninstall-claude-session-wrapper.sh) |
 | Tests | `unittest` | Fixtures: [`claude_session.jsonl`](../../tests/fixtures/claude_session.jsonl), [`codex_session.jsonl`](../../tests/fixtures/codex_session.jsonl) |
@@ -29,11 +29,11 @@ The public usage contract is summarized in the root [`README.md`](../../README.m
 | Layer | Responsibility | Dependency Direction |
 |---|---|---|
 | CLI parsing | `build_parser()` and `main()` select direct monitoring, snapshot, hidden pane worker mode, or Mode B launcher in [`amon`](../../amon) | Calls resolvers, snapshot/tail runtime, or launcher |
-| Session discovery | `candidate_pids()`, `process_command()`, `is_claude_noninteractive()`, `is_codex_exec()`, and `discover_active_sessions()` find active non-interactive sessions | Feeds PID and command context to resolvers |
-| Session resolution | `resolve_claude_session_path()`, `resolve_codex_session_paths()`, and `resolve_path_from_session_id()` map a process or id to JSONL paths | Feeds concrete paths to tail/snapshot |
-| Event formatting | `_format_claude_event()`, `_format_codex_event()`, `_tool_detail()`, and `format_event()` normalize runtime-specific JSONL records | Keeps display rendering separate from tail policy |
+| Session discovery | `candidate_pids()`, `process_command()`, `is_claude_noninteractive()`, `is_codex_exec()`, and `discover_active_sessions()` find active non-interactive sessions | Feeds PID, path, and command context to resolvers |
+| Session resolution | `resolve_claude_session_path()`, `resolve_codex_session_paths()`, `resolve_path_from_session_id()`, and `resolve_session_pid()` map processes, ids, or paths to JSONL paths and live PIDs | Feeds concrete paths and lifecycle context to tail/snapshot |
+| Event formatting | `_format_claude_event()`, `_format_codex_event()`, `_tool_detail()`, `is_agent_exit_event()`, and `format_event()` normalize runtime-specific JSONL records | Keeps display rendering and exit-event detection separate from tail policy |
 | JSONL tailing | `JsonlTail` tracks offsets, skips malformed lines, and resets on truncation | Feeds parsed events to formatting |
-| Idle and lifecycle | `IdleStateMachine`, `_pid_alive()`, `run_tail()`, and `snapshot_status()` decide idle warnings, snapshot exit code, and process-exit output | Uses tail events and optional discovered PID |
+| Idle and lifecycle | `IdleStateMachine`, `_pid_alive()`, `_process_state()`, `run_tail()`, and `snapshot_status()` decide idle warnings, process fields, snapshot exit codes, and exit output | Uses tail events and optional discovered PID |
 | Mode B launcher | `encode_session_spec()`, `decode_session_spec()`, `session_title()`, and `run_mode_b()` pass compact session specs to `xpanes` | Spawns independent single-session monitor processes |
 | Claude wrapper scripts | Install/remove a managed shell function that injects a UUID `--session-id` for new Claude runs | Improves discovery precision before `amon` starts |
 | Test harness | [`tests/test_amon.py`](../../tests/test_amon.py) imports the extensionless executable and verifies CLI, discovery, formatting, tailing, snapshot, launcher, and wrapper scripts | Guards the single-file implementation |
@@ -46,7 +46,7 @@ The core architectural constraint remains that a monitor instance owns exactly o
 |---|---|---|
 | Claude JSONL logs | Mode A and Mode B session input | Resolve from `$HOME/.claude/projects/{cwd-slug}/{session-id}.jsonl`; if the command line contains `--session-id`, that exact file is required |
 | Codex JSONL logs | Mode A and Mode B session input | Resolve from open `.codex/sessions/**/*.jsonl` files reported by `lsof`; default to newest per PID unless `--codex-all-sessions` is set |
-| Host process table | Mode B discovery | `pgrep -f` collects candidates; `ps -o command=` filters to `claude -p` / `claude --print` and direct `codex exec` processes |
+| Host process table | Mode B discovery and lifecycle checks | `pgrep -f` collects candidates; `ps -o command=` filters to `claude -p` / `claude --print` and direct `codex exec` processes; PID probes detect exits |
 | `xpanes` | Visual separation for multiple monitors | Required for no-argument Mode B; missing dependency exits with code `3` |
 | Terminal pane title | Identify sessions in Mode B | `run_mode_b()` sets each pane title to `{runtime}/{session-uuid}` via `--session-title`; non-UUID stems fall back to the full filename stem |
 | Pane retention | Keep final output visible | The `xpanes` command template runs a normal shell command instead of `exec`, so completed monitors leave their pane shell visible |
@@ -58,18 +58,18 @@ The core architectural constraint remains that a monitor instance owns exactly o
 ### 5.1 Mode A Tail
 
 1. User runs `amon --session-id <id>` or a hidden pane worker command with `--session-spec`.
-2. CLI resolves the id/spec to a concrete JSONL path and runtime.
+2. CLI resolves the id/spec to a concrete JSONL path, runtime, and optional PID.
 3. `run_tail()` primes `JsonlTail` at current EOF to avoid replaying history.
 4. New JSONL records are parsed, normalized by runtime-specific formatters, and printed as `[runtime/session] Msg ...` or `[runtime/session] Tool ...`.
 5. `IdleStateMachine` emits one idle warning after the configured silence threshold and rearms after useful activity.
-6. When a discovered PID disappears, the monitor prints `AGENT EXITED` and returns success.
+6. When a discovered PID disappears or a supported agent-exit record appears, the monitor prints `AGENT EXITED` and returns success.
 
 ### 5.2 Mode A Snapshot
 
 1. User runs `amon --session-id <id> --once`.
-2. CLI resolves the session path and scans the file for the last useful formatted event.
-3. `snapshot_status()` compares file mtime with `--idle-threshold`.
-4. Command prints one status line and exits `0` for working, `2` for idle, or `1` when the path is missing.
+2. CLI resolves the session path and, when no PID was supplied, tries to match the path to an active discovered process.
+3. `snapshot_status()` scans the file for the last useful formatted event, compares file mtime with `--idle-threshold`, and resolves `process=alive|exited|unknown`.
+4. Command prints one status line and exits `0` for working, `2` for idle, `4` for exited, or `1` when the path is missing.
 
 ### 5.3 Mode B Discovery
 
@@ -91,14 +91,14 @@ The core architectural constraint remains that a monitor instance owns exactly o
 | Surface | Meaning | Default |
 |---|---|---|
 | `--session-id` | Monitor one known Claude or Codex session id | unset |
-| `--once` | Emit one snapshot line and exit | false |
+| `--once` | Emit one snapshot line with idle and process state, then exit | false |
 | `--idle-threshold` | Seconds without useful activity before idle warning/status | `60.0` |
 | `--codex-all-sessions` | Include every open Codex JSONL for a PID in Mode B | false |
 | `--color` | Control color for direct single-session output | `never` |
 | `--session-path` | Hidden direct path worker entrypoint | unset |
 | `--session-spec` | Hidden Mode B encoded worker entrypoint | unset |
 | `--session-title` | Hidden title renderer for `xpanes` pane labels | unset |
-| `--pid` | Hidden PID lifecycle monitor for direct worker calls | unset |
+| `--pid` | Hidden PID lifecycle monitor for direct worker calls and Mode B panes | unset |
 | Installer `--profile` | Shell profile path to edit | `~/.bash_profile` |
 | Installer `--print` | Print the managed wrapper block without editing | false |
 

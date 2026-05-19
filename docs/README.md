@@ -7,7 +7,7 @@
 
 ## 1. Project Overview
 
-`amon` is a single-file Python CLI that monitors non-interactive Claude and Codex agent sessions by tailing their JSONL session files. It supports direct tailing, one-shot snapshots, and a no-argument discovery mode that opens one `xpanes` pane per active session.
+`amon` is a single-file Python CLI that monitors non-interactive Claude and Codex agent sessions by tailing their JSONL session files. It supports direct tailing with exit reporting, one-shot snapshots with process state, and a no-argument discovery mode that opens one `xpanes` pane per active session.
 
 The implementation is now present in [`../amon`](../amon), with user-facing usage in [`../README.md`](../README.md), regression tests in [`../tests/test_amon.py`](../tests/test_amon.py), and Claude wrapper setup/cleanup in [`install-claude-session-wrapper.sh`](../scripts/install-claude-session-wrapper.sh) and [`uninstall-claude-session-wrapper.sh`](../scripts/uninstall-claude-session-wrapper.sh).
 
@@ -15,7 +15,7 @@ The implementation is now present in [`../amon`](../amon), with user-facing usag
 
 | Document | Purpose |
 |---|---|
-| [system/architecture.md](./system/architecture.md) | Current atlas map of the implemented amon CLI, session resolution, xpanes launcher, wrapper scripts, and tests |
+| [system/architecture.md](./system/architecture.md) | Current atlas map of the implemented amon CLI, session resolution, lifecycle checks, xpanes launcher, wrapper scripts, and tests |
 
 ## 3. Reading Routes
 
@@ -50,7 +50,7 @@ The implementation is now present in [`../amon`](../amon), with user-facing usag
 ### 3.5 Operations / Deployment
 
 1. [`../README.md`](../README.md) install section for copy/symlink usage.
-2. [system/architecture.md](./system/architecture.md) integration points for host command and `xpanes` dependencies.
+2. [system/architecture.md](./system/architecture.md) integration points for host command, process liveness, and `xpanes` dependencies.
 3. [Python stdlib ADR](./arch/260518-231929-python-stdlib.md) for dependency policy.
 4. Shell wrapper scripts when Claude process discoverability needs explicit session ids.
 
