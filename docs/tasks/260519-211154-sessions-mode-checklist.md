@@ -88,11 +88,11 @@
 
 ### Stage 4. 문서와 최종 검증
 
-- [ ] README/usage를 새 기본 모드와 `amon xpane` 구조에 맞춰 갱신한다.
-- [ ] 테스트 suite를 실행한다.
-- [ ] 가능한 경우 TUI를 수동으로 실행해 기본 키 동작을 확인한다.
-- [ ] 구현 subagent 결과와 검증 subagent 결과를 main이 리뷰한다.
-- [ ] 체크리스트 완료 상태를 갱신한다.
+- [x] README/usage를 새 기본 모드와 `amon xpane` 구조에 맞춰 갱신한다.
+- [x] 테스트 suite를 실행한다.
+- [x] 가능한 경우 TUI를 수동으로 실행해 기본 키 동작을 확인한다. (noninteractive sessions list smoke만 수행; curses 수동 키 확인은 미수행)
+- [x] 구현 subagent 결과와 검증 subagent 결과를 main이 리뷰한다.
+- [x] 체크리스트 완료 상태를 갱신한다.
 
 커밋 기준: README/usage, 필요한 테스트 보강, 체크리스트 완료 표시만 포함한다.
 
