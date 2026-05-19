@@ -1006,32 +1006,90 @@ class TestDiscovery(unittest.TestCase):
             3: "codex exec run",
             4: "codex app-server",
         }
+        cwds = {
+            1: "/repo/claude",
+            3: "/repo/codex",
+        }
         with mock.patch.object(amon, "candidate_pids", return_value=[1, 2, 3, 4]):
             with mock.patch.object(amon, "process_command", side_effect=lambda pid: commands[pid]):
-                with mock.patch.object(
-                    amon,
-                    "resolve_claude_session_path",
-                    return_value="/tmp/claude.jsonl",
-                ) as claude_resolver:
+                with mock.patch.object(amon, "process_cwd", side_effect=lambda pid: cwds[pid]):
                     with mock.patch.object(
                         amon,
-                        "resolve_codex_session_paths",
-                        return_value=["/tmp/codex-a.jsonl", "/tmp/codex-b.jsonl"],
-                    ) as codex_resolver:
-                        sessions = amon.discover_active_sessions(codex_all=True)
+                        "resolve_claude_session_path",
+                        return_value="/tmp/claude.jsonl",
+                    ) as claude_resolver:
+                        with mock.patch.object(
+                            amon,
+                            "resolve_codex_session_paths",
+                            return_value=["/tmp/codex-a.jsonl", "/tmp/codex-b.jsonl"],
+                        ) as codex_resolver:
+                            sessions = amon.discover_active_sessions(codex_all=True)
         self.assertEqual(
             sessions,
             [
-                {"agent": "claude", "pid": 1, "path": "/tmp/claude.jsonl"},
-                {"agent": "codex", "pid": 3, "path": "/tmp/codex-a.jsonl"},
-                {"agent": "codex", "pid": 3, "path": "/tmp/codex-b.jsonl"},
+                {
+                    "agent": "claude",
+                    "pid": 1,
+                    "path": "/tmp/claude.jsonl",
+                    "cwd": "/repo/claude",
+                    "command": "claude -p hello",
+                },
+                {
+                    "agent": "codex",
+                    "pid": 3,
+                    "path": "/tmp/codex-a.jsonl",
+                    "cwd": "/repo/codex",
+                    "command": "codex exec run",
+                },
+                {
+                    "agent": "codex",
+                    "pid": 3,
+                    "path": "/tmp/codex-b.jsonl",
+                    "cwd": "/repo/codex",
+                    "command": "codex exec run",
+                },
             ],
         )
         claude_resolver.assert_called_once_with(
             1,
             cmdline="claude -p hello",
+            cwd="/repo/claude",
         )
         codex_resolver.assert_called_once_with(3, all_sessions=True)
+
+    def test_discover_active_sessions_all_scope_preserves_cwd_for_project_render(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alpha = Path(tmp) / "alpha-session.jsonl"
+            beta = Path(tmp) / "beta-session.jsonl"
+            alpha.write_text("{}\n", encoding="utf-8")
+            beta.write_text("{}\n", encoding="utf-8")
+            os.utime(alpha, (200, 200))
+            os.utime(beta, (100, 100))
+
+            commands = {1: "codex exec run alpha", 2: "codex exec run beta"}
+            cwds = {1: "/workspace/team-a/api", 2: "/workspace/team-b/api"}
+            paths = {1: [str(alpha)], 2: [str(beta)]}
+
+            with mock.patch.object(amon, "candidate_pids", return_value=[1, 2]):
+                with mock.patch.object(amon, "process_command", side_effect=lambda pid: commands[pid]):
+                    with mock.patch.object(amon, "process_cwd", side_effect=lambda pid: cwds[pid]):
+                        with mock.patch.object(
+                            amon,
+                            "resolve_codex_session_paths",
+                            side_effect=lambda pid, all_sessions=False: paths[pid],
+                        ):
+                            sessions = amon.discover_active_sessions(scope=amon.SCOPE_ALL)
+
+            state = amon.SessionListState(scope=amon.SCOPE_ALL)
+            state.merge_discovered(sessions, now=10, pid_alive_func=lambda _pid: True)
+            lines = amon.render_session_list_lines(state, width=140, height=8, now=11)
+
+        self.assertEqual(
+            [session["cwd"] for session in sessions],
+            ["/workspace/team-a/api", "/workspace/team-b/api"],
+        )
+        self.assertTrue(any("team-a/api" in line for line in lines))
+        self.assertTrue(any("team-b/api" in line for line in lines))
 
     def test_discover_active_sessions_current_scope_filters_by_process_cwd(self):
         commands = {
@@ -1072,12 +1130,14 @@ class TestDiscovery(unittest.TestCase):
                     "pid": 1,
                     "path": "/tmp/claude.jsonl",
                     "cwd": "/repo",
+                    "command": "claude -p hello",
                 },
                 {
                     "agent": "codex",
                     "pid": 2,
                     "path": "/tmp/codex.jsonl",
                     "cwd": "/repo/sub",
+                    "command": "codex exec run",
                 },
             ],
         )
@@ -1106,6 +1166,173 @@ class TestDiscovery(unittest.TestCase):
     def test_resolve_session_pid_returns_none_without_live_match(self):
         with mock.patch.object(amon, "discover_active_sessions", return_value=[]):
             self.assertIsNone(amon.resolve_session_pid("/tmp/session.jsonl", "codex"))
+
+
+class TestSessionAggregation(unittest.TestCase):
+    def _write_jsonl(self, root, relative, lines, mtime):
+        path = Path(root) / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{json.dumps(line)}\n" for line in lines), encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+        return str(path)
+
+    def test_session_id_status_priority_counts_and_label_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            failed = self._write_jsonl(
+                tmp,
+                "a/same-session.jsonl",
+                [
+                    {"metadata": {"title": "Release watcher"}},
+                    {"type": "result", "subtype": "error_during_execution"},
+                ],
+                100,
+            )
+            running = self._write_jsonl(tmp, "b/same-session.jsonl", [], 200)
+            command_only = self._write_jsonl(tmp, "solo-session.jsonl", [], 150)
+
+            sessions = [
+                {
+                    "agent": "claude",
+                    "pid": 1,
+                    "path": failed,
+                    "cwd": "/repo/service",
+                    "command": "claude -p release",
+                },
+                {
+                    "agent": "claude",
+                    "pid": 2,
+                    "path": running,
+                    "cwd": "/repo/service",
+                    "command": "claude -p release",
+                },
+                {
+                    "agent": "codex",
+                    "pid": 3,
+                    "path": command_only,
+                    "cwd": "/repo/tool",
+                    "command": "codex exec inspect",
+                },
+            ]
+            entries = amon.aggregate_sessions(
+                sessions,
+                pid_alive_func=lambda pid: pid in {2, 3},
+            )
+
+        same = next(entry for entry in entries if entry.session_id == "same-session")
+        solo = next(entry for entry in entries if entry.session_id == "solo-session")
+        self.assertEqual(same.status, "failed")
+        self.assertEqual(same.label, "Release watcher")
+        self.assertIn("claude -p release", same.search_text)
+        self.assertEqual(solo.status, "running")
+        self.assertEqual(solo.label, "codex exec inspect")
+        self.assertEqual(amon.count_session_statuses(entries)["failed"], 1)
+        self.assertEqual(amon.count_session_statuses(entries)["running"], 1)
+        self.assertLess(entries.index(same), entries.index(solo))
+
+    def test_disambiguate_project_paths_expands_from_right(self):
+        displays = amon.disambiguate_project_paths(
+            [
+                "/Users/dane/work/api",
+                "/Users/dane/side/api",
+                "/Users/dane/work/web",
+            ]
+        )
+        self.assertEqual(displays["/Users/dane/work/api"], "work/api")
+        self.assertEqual(displays["/Users/dane/side/api"], "side/api")
+        self.assertEqual(displays["/Users/dane/work/web"], "web")
+
+    def test_missing_activity_sorts_last(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            active = self._write_jsonl(tmp, "active.jsonl", [], 100)
+            missing = str(Path(tmp) / "missing.jsonl")
+            entries = amon.aggregate_sessions(
+                [
+                    {"agent": "codex", "path": missing},
+                    {"agent": "codex", "path": active},
+                ]
+            )
+        self.assertEqual([entry.session_id for entry in entries], ["active", "missing"])
+        self.assertEqual(entries[-1].activity_mtime, None)
+
+
+class TestSessionListState(unittest.TestCase):
+    def _write_jsonl(self, root, name, lines, mtime):
+        path = Path(root) / name
+        path.write_text("".join(f"{json.dumps(line)}\n" for line in lines), encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+        return str(path)
+
+    def test_merge_search_hide_and_render_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            active = self._write_jsonl(
+                tmp,
+                "active.jsonl",
+                [{"metadata": {"label": "Alpha task"}}],
+                200,
+            )
+            exited = self._write_jsonl(
+                tmp,
+                "exited.jsonl",
+                [{"type": "result", "subtype": "success"}],
+                100,
+            )
+            state = amon.SessionListState(scope=amon.SCOPE_ALL)
+            state.merge_discovered(
+                [
+                    {
+                        "agent": "claude",
+                        "pid": 10,
+                        "path": active,
+                        "cwd": "/repo/alpha",
+                        "command": "claude -p alpha",
+                    },
+                    {
+                        "agent": "claude",
+                        "path": exited,
+                        "cwd": "/repo/beta",
+                        "command": "claude -p beta",
+                    },
+                ],
+                now=10,
+                pid_alive_func=lambda pid: pid == 10,
+            )
+
+            lines = amon.render_session_list_lines(state, width=120, height=8, now=11)
+            self.assertIn("running=1", lines[0])
+            self.assertIn("exited=1", lines[0])
+            self.assertTrue(any("* R claude active" in line for line in lines))
+
+            amon.handle_session_list_key(state, "/")
+            amon.handle_session_list_key(state, "a")
+            amon.handle_session_list_key(state, "l")
+            self.assertEqual([entry.session_id for entry in state.visible_entries()], ["active"])
+
+            amon.handle_session_list_key(state, "ENTER")
+            state.query = ""
+            hidden = state.hide_visible_finished()
+            self.assertEqual(hidden, 1)
+            self.assertEqual(state.visible_counts()["exited"], 0)
+
+    def test_missing_discovered_session_transitions_running_to_exited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            active = self._write_jsonl(tmp, "active.jsonl", [], 100)
+            state = amon.SessionListState(scope=amon.SCOPE_ALL)
+            state.merge_discovered(
+                [{"agent": "codex", "pid": 10, "path": active, "command": "codex exec run"}],
+                now=1,
+                pid_alive_func=lambda pid: True,
+            )
+            self.assertEqual(state.entries["active"].status, "running")
+
+            state.merge_discovered([], now=2)
+            self.assertEqual(state.entries["active"].status, "exited")
+            self.assertEqual(state.entries["active"].pids, ())
+
+    def test_key_handling_quit_and_enter_placeholder(self):
+        state = amon.SessionListState()
+        self.assertEqual(amon.handle_session_list_key(state, "q"), "quit")
+        self.assertIsNone(amon.handle_session_list_key(state, "ENTER"))
+        self.assertIn("detail view", state.status_message)
 
 
 class TestModeBLauncher(unittest.TestCase):

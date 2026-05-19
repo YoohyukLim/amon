@@ -62,15 +62,15 @@
 
 ### Stage 2. session aggregation과 목록 TUI
 
-- [ ] session-id 기준 aggregation 모델을 구현한다.
-- [ ] 대표 상태와 상태별 count를 계산한다.
-- [ ] label/title/command/session-id fallback을 구현한다.
-- [ ] project display disambiguation을 구현한다.
-- [ ] 1초 polling으로 새 session을 merge한다.
-- [ ] 최근 activity 정렬과 activity 없음 하단 정렬을 구현한다.
-- [ ] 목록 TUI에 header, summary count, legend, status line을 표시한다.
-- [ ] `/` 검색, `r` 숨김, `q` 종료, 3초 highlight를 구현한다.
-- [ ] aggregation과 목록 상태 전이 테스트를 추가한다.
+- [x] session-id 기준 aggregation 모델을 구현한다.
+- [x] 대표 상태와 상태별 count를 계산한다.
+- [x] label/title/command/session-id fallback을 구현한다.
+- [x] project display disambiguation을 구현한다.
+- [x] 1초 polling으로 새 session을 merge한다.
+- [x] 최근 activity 정렬과 activity 없음 하단 정렬을 구현한다.
+- [x] 목록 TUI에 header, summary count, legend, status line을 표시한다.
+- [x] `/` 검색, `r` 숨김, `q` 종료, 3초 highlight를 구현한다.
+- [x] aggregation과 목록 상태 전이 테스트를 추가한다.
 
 커밋 기준: sessions 목록 TUI와 aggregation 테스트만 포함한다.
 

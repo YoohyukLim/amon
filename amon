@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import curses
 import json
 import os
 import re
@@ -25,6 +26,57 @@ UUID_RE = re.compile(
 )
 SCOPE_ALL = "all"
 SCOPE_CURRENT = "current"
+SESSION_STATUSES = ("failed", "running", "unknown", "exited")
+STATUS_PRIORITY = {"failed": 3, "running": 2, "unknown": 1, "exited": 0}
+STATUS_ICONS = {"failed": "!", "running": "R", "unknown": "?", "exited": "x"}
+SESSION_HIGHLIGHT_SECONDS = 3.0
+
+
+class LogSummary:
+    def __init__(self):
+        self.metadata_values: list[str] = []
+        self.command = ""
+        self.terminal_status: Optional[str] = None
+        self.activity_mtime: Optional[float] = None
+
+
+class SessionEntry:
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        agent: str,
+        path: str,
+        status: str,
+        label: str,
+        project_display: str = "-",
+        cwd: Optional[str] = None,
+        command: str = "",
+        metadata_values: tuple[str, ...] = (),
+        search_text: str = "",
+        activity_mtime: Optional[float] = None,
+        paths: tuple[str, ...] = (),
+        pids: tuple[int, ...] = (),
+        first_seen: float = 0.0,
+        last_seen: float = 0.0,
+        highlight_until: float = 0.0,
+    ):
+        self.session_id = session_id
+        self.agent = agent
+        self.path = path
+        self.status = status
+        self.label = label
+        self.project_display = project_display
+        self.cwd = cwd
+        self.command = command
+        self.metadata_values = metadata_values
+        self.search_text = search_text
+        self.activity_mtime = activity_mtime
+        self.paths = paths
+        self.pids = pids
+        self.first_seen = first_seen
+        self.last_seen = last_seen
+        self.highlight_until = highlight_until
 
 
 def cwd_to_claude_slug(cwd: str) -> str:
@@ -610,10 +662,18 @@ def _scope_root(scope: str, cwd: Optional[str]) -> Optional[str]:
     raise ValueError(f"invalid discovery scope: {scope}")
 
 
-def _session_record(agent: str, pid: int, path: str, cwd: Optional[str] = None) -> dict:
+def _session_record(
+    agent: str,
+    pid: int,
+    path: str,
+    cwd: Optional[str] = None,
+    command: str = "",
+) -> dict:
     session = {"agent": agent, "pid": pid, "path": path}
     if cwd:
         session["cwd"] = cwd
+    if command:
+        session["command"] = command
     return session
 
 
@@ -626,22 +686,26 @@ def discover_active_sessions(
     sessions: list[dict] = []
     for pid in candidate_pids(["claude", "codex"]):
         cmdline = process_command(pid)
-        current_cwd = None
+        claude_candidate = is_claude_noninteractive(cmdline)
+        codex_candidate = is_codex_exec(cmdline)
+        if not claude_candidate and not codex_candidate:
+            continue
+
+        current_cwd = process_cwd(pid)
         if root is not None:
-            current_cwd = process_cwd(pid)
             if not current_cwd or not _is_path_at_or_under(current_cwd, root):
                 continue
-        if is_claude_noninteractive(cmdline):
+        if claude_candidate:
             if current_cwd is None:
                 path = resolve_claude_session_path(pid, cmdline=cmdline)
             else:
                 path = resolve_claude_session_path(pid, cmdline=cmdline, cwd=current_cwd)
             if path:
-                sessions.append(_session_record("claude", pid, path, current_cwd))
+                sessions.append(_session_record("claude", pid, path, current_cwd, cmdline))
             continue
-        if is_codex_exec(cmdline):
+        if codex_candidate:
             for path in resolve_codex_session_paths(pid, all_sessions=codex_all):
-                sessions.append(_session_record("codex", pid, path, current_cwd))
+                sessions.append(_session_record("codex", pid, path, current_cwd, cmdline))
     return sessions
 
 
@@ -696,6 +760,567 @@ def session_title(session: dict) -> str:
     return f"{agent}/{match.group(1) if match else stem}"
 
 
+def session_id_from_path(path: str) -> str:
+    stem = Path(path).stem
+    match = UUID_RE.search(stem)
+    return match.group(1) if match else (stem or "session")
+
+
+def _clean_text(value: object) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
+
+
+def _unique_preserve_order(values: list[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return tuple(unique)
+
+
+def _metadata_values_from_event(ev: dict) -> list[str]:
+    containers: list[dict] = []
+    if ev.get("type") in {"session", "session_meta", "session_metadata"}:
+        containers.append(ev)
+    for key in ("metadata", "session"):
+        value = ev.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+
+    payload = ev.get("payload") or ev.get("item")
+    if isinstance(payload, dict):
+        if payload.get("type") in {"session", "session_meta", "session_metadata"}:
+            containers.append(payload)
+        for key in ("metadata", "session"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                containers.append(value)
+
+    values: list[str] = []
+    for container in containers:
+        for key in ("label", "name", "title"):
+            text = _clean_text(container.get(key))
+            if text:
+                values.append(text)
+    return values
+
+
+def _command_summary_from_event(ev: dict, agent: str) -> str:
+    if agent == "claude":
+        formatted = _format_claude_event(ev)
+    elif agent == "codex":
+        formatted = _format_codex_event(ev)
+    else:
+        formatted = None
+    if formatted and formatted[0] == "Tool":
+        return formatted[1]
+    return ""
+
+
+def _failure_marker(container: dict) -> bool:
+    if container.get("is_error") is True:
+        return True
+    for key in ("status", "subtype", "outcome", "result"):
+        value = container.get(key)
+        if value is None:
+            continue
+        lowered = str(value).lower()
+        if any(token in lowered for token in ("fail", "error", "exception", "abort")):
+            return True
+    for key in ("exit_code", "code"):
+        value = container.get(key)
+        if isinstance(value, int) and value != 0:
+            return True
+    return False
+
+
+def _event_terminal_status(ev: dict, agent: str) -> Optional[str]:
+    payload = ev.get("payload") or ev.get("item")
+    payload_type = payload.get("type") if isinstance(payload, dict) else None
+    containers = [ev]
+    if isinstance(payload, dict):
+        containers.append(payload)
+
+    if any(_failure_marker(container) for container in containers):
+        if (
+            is_agent_exit_event(ev, agent)
+            or ev.get("type") in {"error", "failure", "failed"}
+            or payload_type in {"error", "failure", "failed"}
+        ):
+            return "failed"
+
+    return "exited" if is_agent_exit_event(ev, agent) else None
+
+
+def read_log_summary(session_path: str, agent: str) -> LogSummary:
+    summary = LogSummary()
+    path = Path(session_path)
+    if not path.exists():
+        return summary
+
+    try:
+        summary.activity_mtime = path.stat().st_mtime
+    except OSError:
+        return summary
+
+    try:
+        handle = path.open("r", encoding="utf-8")
+    except OSError:
+        return summary
+
+    with handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            summary.metadata_values.extend(_metadata_values_from_event(event))
+            if not summary.command:
+                summary.command = _command_summary_from_event(event, agent)
+            terminal_status = _event_terminal_status(event, agent)
+            if terminal_status == "failed":
+                summary.terminal_status = "failed"
+            elif terminal_status == "exited" and summary.terminal_status != "failed":
+                summary.terminal_status = "exited"
+    summary.metadata_values = list(_unique_preserve_order(summary.metadata_values))
+    return summary
+
+
+def _session_record_status(
+    session: dict,
+    summary: LogSummary,
+    pid_alive_func=None,
+) -> str:
+    if summary.terminal_status:
+        return summary.terminal_status
+
+    pid = session.get("pid")
+    if isinstance(pid, int):
+        alive = (pid_alive_func or _pid_alive)(pid)
+        return "running" if alive else "exited"
+
+    if summary.activity_mtime is None:
+        return "unknown"
+    return "unknown"
+
+
+def representative_status(statuses: list[str]) -> str:
+    if not statuses:
+        return "unknown"
+    return max(statuses, key=lambda status: STATUS_PRIORITY.get(status, 1))
+
+
+def _path_segments(path: str) -> list[str]:
+    parts = []
+    for part in Path(_realpath(path)).parts:
+        if part and part != os.sep:
+            parts.append(part)
+    return parts or [os.sep]
+
+
+def disambiguate_project_paths(paths: list[str]) -> dict[str, str]:
+    unique_paths = sorted({_realpath(path) for path in paths if path})
+    if not unique_paths:
+        return {}
+
+    segments_by_path = {path: _path_segments(path) for path in unique_paths}
+    depths = {path: 1 for path in unique_paths}
+
+    while True:
+        labels = {
+            path: "/".join(segments_by_path[path][-depths[path] :])
+            for path in unique_paths
+        }
+        duplicates = {
+            label
+            for label in labels.values()
+            if list(labels.values()).count(label) > 1
+        }
+        if not duplicates:
+            return labels
+
+        changed = False
+        for path, label in labels.items():
+            if label in duplicates and depths[path] < len(segments_by_path[path]):
+                depths[path] += 1
+                changed = True
+        if not changed:
+            return labels
+
+
+def assign_project_displays(entries: list[SessionEntry], scope: str) -> None:
+    if scope == SCOPE_ALL:
+        mapping = disambiguate_project_paths([entry.cwd or "" for entry in entries])
+        for entry in entries:
+            entry.project_display = mapping.get(_realpath(entry.cwd), "-") if entry.cwd else "-"
+        return
+
+    for entry in entries:
+        entry.project_display = Path(_realpath(entry.cwd)).name if entry.cwd else "-"
+
+
+def aggregate_sessions(
+    sessions: list[dict],
+    scope: str = SCOPE_ALL,
+    *,
+    pid_alive_func=None,
+) -> list[SessionEntry]:
+    groups: dict[str, dict] = {}
+    summaries: dict[tuple[str, str], LogSummary] = {}
+
+    for session in sessions:
+        path = str(session.get("path") or "")
+        if not path:
+            continue
+        agent = str(session.get("agent") or infer_agent_from_path(path))
+        session_id = session_id_from_path(path)
+        summary_key = (path, agent)
+        summary = summaries.get(summary_key)
+        if summary is None:
+            summary = read_log_summary(path, agent)
+            summaries[summary_key] = summary
+
+        status = _session_record_status(session, summary, pid_alive_func=pid_alive_func)
+        command = _clean_text(session.get("command")) or summary.command
+        pid = session.get("pid")
+        group = groups.setdefault(
+            session_id,
+            {
+                "session_id": session_id,
+                "agent": agent,
+                "path": path,
+                "paths": [],
+                "pids": [],
+                "statuses": [],
+                "metadata_values": [],
+                "commands": [],
+                "cwd": session.get("cwd"),
+                "activity_mtime": summary.activity_mtime,
+            },
+        )
+        group["paths"].append(path)
+        if isinstance(pid, int):
+            group["pids"].append(pid)
+        group["statuses"].append(status)
+        group["metadata_values"].extend(summary.metadata_values)
+        if command:
+            group["commands"].append(command)
+        if not group["cwd"] and session.get("cwd"):
+            group["cwd"] = session.get("cwd")
+        if summary.activity_mtime is not None:
+            current_mtime = group["activity_mtime"]
+            if current_mtime is None or summary.activity_mtime > current_mtime:
+                group["activity_mtime"] = summary.activity_mtime
+                group["path"] = path
+                group["agent"] = agent
+
+    entries: list[SessionEntry] = []
+    for group in groups.values():
+        metadata_values = _unique_preserve_order(group["metadata_values"])
+        commands = _unique_preserve_order(group["commands"])
+        label = metadata_values[0] if metadata_values else (commands[0] if commands else group["session_id"])
+        search_parts = list(metadata_values) + list(commands) + [group["session_id"]]
+        entries.append(
+            SessionEntry(
+                session_id=group["session_id"],
+                agent=group["agent"],
+                path=group["path"],
+                status=representative_status(group["statuses"]),
+                label=label,
+                cwd=group["cwd"],
+                command=commands[0] if commands else "",
+                metadata_values=metadata_values,
+                search_text=" ".join(search_parts).lower(),
+                activity_mtime=group["activity_mtime"],
+                paths=_unique_preserve_order(group["paths"]),
+                pids=tuple(sorted(set(group["pids"]))),
+            )
+        )
+
+    assign_project_displays(entries, scope)
+    return sort_session_entries(entries)
+
+
+def sort_session_entries(entries: list[SessionEntry]) -> list[SessionEntry]:
+    return sorted(
+        entries,
+        key=lambda entry: (
+            entry.activity_mtime is None,
+            -(entry.activity_mtime or 0.0),
+            entry.session_id,
+        ),
+    )
+
+
+def count_session_statuses(entries: list[SessionEntry]) -> dict[str, int]:
+    counts = {status: 0 for status in SESSION_STATUSES}
+    for entry in entries:
+        counts[entry.status if entry.status in counts else "unknown"] += 1
+    return counts
+
+
+def filter_session_entries(entries: list[SessionEntry], query: str) -> list[SessionEntry]:
+    ordered = sort_session_entries(entries)
+    query = query.strip().lower()
+    if not query:
+        return ordered
+    return [entry for entry in ordered if query in entry.search_text]
+
+
+class SessionListState:
+    def __init__(self, scope: str = SCOPE_ALL, cwd: Optional[str] = None):
+        self.scope = scope
+        self.cwd = cwd
+        self.entries: dict[str, SessionEntry] = {}
+        self.hidden_session_ids: set[str] = set()
+        self.query = ""
+        self.searching = False
+        self.cursor = 0
+        self.status_message = "Enter detail is pending; q quits"
+
+    def merge_discovered(
+        self,
+        sessions: list[dict],
+        now: float,
+        *,
+        pid_alive_func=None,
+    ) -> None:
+        discovered = aggregate_sessions(
+            sessions,
+            scope=self.scope,
+            pid_alive_func=pid_alive_func,
+        )
+        discovered_ids = {entry.session_id for entry in discovered}
+
+        for entry in discovered:
+            previous = self.entries.get(entry.session_id)
+            if previous is None:
+                entry.first_seen = now
+                entry.highlight_until = now + SESSION_HIGHLIGHT_SECONDS
+            else:
+                entry.first_seen = previous.first_seen
+                entry.highlight_until = previous.highlight_until
+            entry.last_seen = now
+            self.entries[entry.session_id] = entry
+
+        for session_id, entry in self.entries.items():
+            if session_id in discovered_ids:
+                continue
+            if entry.status == "running":
+                entry.status = "exited"
+            entry.pids = ()
+
+        assign_project_displays(list(self.entries.values()), self.scope)
+        self._clamp_cursor()
+
+    def visible_entries(self) -> list[SessionEntry]:
+        entries = [
+            entry
+            for entry in self.entries.values()
+            if entry.session_id not in self.hidden_session_ids
+        ]
+        return filter_session_entries(entries, self.query)
+
+    def visible_counts(self) -> dict[str, int]:
+        return count_session_statuses(self.visible_entries())
+
+    def hide_visible_finished(self) -> int:
+        finished = [
+            entry.session_id
+            for entry in self.visible_entries()
+            if entry.status in {"exited", "failed"}
+        ]
+        self.hidden_session_ids.update(finished)
+        self.status_message = f"hid {len(finished)} exited/failed session(s)"
+        self._clamp_cursor()
+        return len(finished)
+
+    def _clamp_cursor(self) -> None:
+        visible_count = len(self.visible_entries())
+        if visible_count == 0:
+            self.cursor = 0
+        else:
+            self.cursor = min(max(0, self.cursor), visible_count - 1)
+
+
+def handle_session_list_key(state: SessionListState, key: str) -> Optional[str]:
+    if state.searching:
+        if key == "ENTER":
+            state.searching = False
+            state.status_message = f"search=/{state.query}" if state.query else "search cleared"
+        elif key == "ESC":
+            state.searching = False
+            state.status_message = "search cancelled"
+        elif key == "BACKSPACE":
+            state.query = state.query[:-1]
+            state._clamp_cursor()
+        elif len(key) == 1 and key.isprintable():
+            state.query += key
+            state._clamp_cursor()
+        return None
+
+    if key == "q":
+        return "quit"
+    if key == "/":
+        state.searching = True
+        state.status_message = "search mode"
+        return None
+    if key == "r":
+        state.hide_visible_finished()
+        return None
+    if key == "UP":
+        state.cursor = max(0, state.cursor - 1)
+        return None
+    if key == "DOWN":
+        state.cursor = min(max(0, len(state.visible_entries()) - 1), state.cursor + 1)
+        return None
+    if key == "ENTER":
+        state.status_message = "detail view is not implemented in this stage"
+        return None
+    return None
+
+
+def _clip_line(line: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(line) <= width:
+        return line
+    if width <= 3:
+        return line[:width]
+    return line[: width - 3] + "..."
+
+
+def _scope_project_label(scope: str, cwd: Optional[str]) -> str:
+    if scope == SCOPE_CURRENT:
+        return Path(_realpath(cwd or os.getcwd())).name or _realpath(cwd or os.getcwd())
+    return "all"
+
+
+def _format_counts(counts: dict[str, int]) -> str:
+    return " ".join(f"{status}={counts.get(status, 0)}" for status in SESSION_STATUSES)
+
+
+def render_session_list_lines(
+    state: SessionListState,
+    width: int = 100,
+    height: int = 24,
+    now: Optional[float] = None,
+) -> list[str]:
+    current = time.monotonic() if now is None else now
+    visible = state.visible_entries()
+    counts = count_session_statuses(visible)
+    total = len(visible)
+    hidden = len(state.hidden_session_ids)
+    search = f"/{state.query}" if state.query else "-"
+    lines = [
+        f"amon sessions total={total} {_format_counts(counts)}",
+        f"scope={state.scope} project={_scope_project_label(state.scope, state.cwd)} "
+        f"search={search} hidden={hidden}",
+        "! failed  R running  ? unknown  x exited    / search  r hide done  q quit",
+    ]
+
+    row_budget = max(1, height - len(lines) - 1)
+    cursor = min(state.cursor, max(0, len(visible) - 1))
+    start = 0
+    if cursor >= row_budget:
+        start = cursor - row_budget + 1
+    rows = visible[start : start + row_budget]
+
+    if not rows:
+        lines.append("(no sessions found)")
+    else:
+        for offset, entry in enumerate(rows, start=start):
+            selected = ">" if offset == cursor else " "
+            highlight = "*" if entry.highlight_until > current else " "
+            icon = STATUS_ICONS.get(entry.status, "?")
+            sid = entry.session_id[:8]
+            line = (
+                f"{selected}{highlight} {icon} {entry.agent:<6} {sid:<8} "
+                f"{entry.project_display:<18} {entry.label}"
+            )
+            lines.append(line)
+
+    if state.searching:
+        status_line = f"search: /{state.query}"
+    else:
+        status_line = state.status_message
+    lines.append(status_line)
+    return [_clip_line(line, width) for line in lines[:height]]
+
+
+def _curses_key_name(key: int) -> Optional[str]:
+    if key == -1:
+        return None
+    if key == curses.KEY_UP:
+        return "UP"
+    if key == curses.KEY_DOWN:
+        return "DOWN"
+    if key in (curses.KEY_ENTER, 10, 13):
+        return "ENTER"
+    if key in (curses.KEY_BACKSPACE, 8, 127):
+        return "BACKSPACE"
+    if key == 27:
+        return "ESC"
+    if 0 <= key <= 255:
+        return chr(key)
+    return None
+
+
+def _draw_session_list(stdscr, state: SessionListState, now: float) -> None:
+    height, width = stdscr.getmaxyx()
+    lines = render_session_list_lines(state, width=max(1, width - 1), height=height, now=now)
+    stdscr.erase()
+    for row, line in enumerate(lines):
+        try:
+            stdscr.addnstr(row, 0, line, max(0, width - 1))
+        except curses.error:
+            pass
+    stdscr.refresh()
+
+
+def _run_sessions_tui(
+    stdscr,
+    codex_all: bool,
+    scope: str,
+    cwd: Optional[str],
+    *,
+    poll_interval: float = 1.0,
+) -> int:
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    stdscr.timeout(100)
+
+    state = SessionListState(scope=scope, cwd=cwd)
+    next_poll = 0.0
+
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= next_poll:
+                sessions = discover_active_sessions(codex_all=codex_all, scope=scope, cwd=cwd)
+                state.merge_discovered(sessions, now)
+                next_poll = now + poll_interval
+
+            _draw_session_list(stdscr, state, now)
+            key = _curses_key_name(stdscr.getch())
+            if key and handle_session_list_key(state, key) == "quit":
+                return 0
+    except KeyboardInterrupt:
+        return 0
+
+
 def run_mode_b(
     idle_threshold: float,
     codex_all: bool,
@@ -737,13 +1362,25 @@ def run_sessions_mode(
     output=None,
     error=None,
 ) -> int:
-    err = error or sys.stderr
-    discover_active_sessions(codex_all=codex_all, scope=scope, cwd=cwd)
-    print(
-        "amon: sessions list TUI is not implemented yet; use 'amon xpane' for pane mode",
-        file=err,
+    stream = output or sys.stdout
+    if output is not None or not stream.isatty():
+        state = SessionListState(scope=scope, cwd=cwd)
+        state.merge_discovered(
+            discover_active_sessions(codex_all=codex_all, scope=scope, cwd=cwd),
+            time.monotonic(),
+        )
+        for line in render_session_list_lines(state):
+            print(line, file=stream)
+        return 0
+
+    return curses.wrapper(
+        lambda stdscr: _run_sessions_tui(
+            stdscr,
+            codex_all=codex_all,
+            scope=scope,
+            cwd=cwd,
+        )
     )
-    return 1
 
 
 def infer_agent_from_path(path: str) -> str:
