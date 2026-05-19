@@ -1,5 +1,11 @@
 # amon Implementation Plan
 
+> **Superseded for execution:** Use
+> `docs/tasks/260519-090729-amon-implementation-v2.md` before implementing.
+> This original plan is still useful as historical task scaffolding, but its
+> Task 5 / Task 8 / Task 9 details were revised after real Claude/Codex JSONL
+> schema and Mode B PID-passing review.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Single Python file `amon` that monitors active claude/codex non-interactive sessions — Mode A (single-session tail / snapshot via `--session-id`) and Mode B (auto-discover all active sessions, spawn one monitor per pane via xpanes).
