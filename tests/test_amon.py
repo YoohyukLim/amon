@@ -3,6 +3,7 @@ import json
 import io
 from importlib.machinery import SourceFileLoader
 import os
+import subprocess
 import tempfile
 import time
 from unittest import mock
@@ -23,6 +24,47 @@ class TestFixtureFiles(unittest.TestCase):
     def test_fixture_files_exist(self):
         self.assertTrue((FIXTURES / "claude_session.jsonl").exists())
         self.assertTrue((FIXTURES / "codex_session.jsonl").exists())
+
+
+class TestClaudeSessionWrapperInstaller(unittest.TestCase):
+    def test_print_contains_lowercase_uuid_session_wrapper(self):
+        script = ROOT / "scripts" / "install-claude-session-wrapper.sh"
+        proc = subprocess.run(
+            [str(script), "--print"],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.assertIn("claude()", proc.stdout)
+        self.assertIn("uuidgen | tr '[:upper:]' '[:lower:]'", proc.stdout)
+        self.assertIn('command claude --session-id "$amon_claude_session_id" "$@"', proc.stdout)
+        self.assertIn("--resume|--continue", proc.stdout)
+
+    def test_installer_replaces_existing_managed_block(self):
+        script = ROOT / "scripts" / "install-claude-session-wrapper.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / ".bash_profile"
+            profile.write_text(
+                "before\n"
+                "# >>> amon claude session wrapper >>>\n"
+                "old\n"
+                "# <<< amon claude session wrapper <<<\n"
+                "after\n",
+                encoding="utf-8",
+            )
+            for _ in range(2):
+                subprocess.run(
+                    [str(script), "--profile", str(profile)],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    text=True,
+                )
+            content = profile.read_text(encoding="utf-8")
+        self.assertIn("before", content)
+        self.assertIn("after", content)
+        self.assertNotIn("\nold\n", content)
+        self.assertEqual(content.count("# >>> amon claude session wrapper >>>"), 1)
+        self.assertEqual(content.count("command claude --session-id"), 1)
 
 
 class TestSkeleton(unittest.TestCase):

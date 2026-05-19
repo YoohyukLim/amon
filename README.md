@@ -19,6 +19,19 @@ or:
 ln -s "$(pwd)/amon" ~/bin/amon
 ```
 
+To make new Claude sessions discoverable even when `claude` is launched
+without an explicit session id, install the shell wrapper:
+
+```bash
+./scripts/install-claude-session-wrapper.sh --profile ~/.bash_profile
+source ~/.bash_profile
+```
+
+The wrapper is a shell function, not a plain alias, so every invocation gets a
+fresh lowercase UUID from `uuidgen | tr '[:upper:]' '[:lower:]'`. Calls that
+already pass `--session-id`, `--resume`, or `--continue` are forwarded
+unchanged.
+
 ## Modes
 
 Open one pane per discovered non-interactive Claude or Codex session:
