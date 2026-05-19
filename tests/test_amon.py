@@ -66,6 +66,53 @@ class TestClaudeSessionWrapperInstaller(unittest.TestCase):
         self.assertEqual(content.count("# >>> amon claude session wrapper >>>"), 1)
         self.assertEqual(content.count("command claude --session-id"), 1)
 
+    def test_uninstaller_removes_only_managed_block(self):
+        install_script = ROOT / "scripts" / "install-claude-session-wrapper.sh"
+        uninstall_script = ROOT / "scripts" / "uninstall-claude-session-wrapper.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / ".bash_profile"
+            profile.write_text("before\nafter\n", encoding="utf-8")
+            subprocess.run(
+                [str(install_script), "--profile", str(profile)],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            subprocess.run(
+                [str(uninstall_script), "--profile", str(profile)],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            content = profile.read_text(encoding="utf-8")
+        self.assertIn("before", content)
+        self.assertIn("after", content)
+        self.assertNotIn("# >>> amon claude session wrapper >>>", content)
+        self.assertNotIn("command claude --session-id", content)
+
+    def test_uninstaller_is_noop_without_profile_or_block(self):
+        uninstall_script = ROOT / "scripts" / "uninstall-claude-session-wrapper.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing_profile"
+            proc = subprocess.run(
+                [str(uninstall_script), "--profile", str(missing)],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            self.assertIn("nothing to remove", proc.stdout)
+
+            profile = Path(tmp) / ".bash_profile"
+            profile.write_text("plain\n", encoding="utf-8")
+            proc = subprocess.run(
+                [str(uninstall_script), "--profile", str(profile)],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            self.assertIn("nothing to remove", proc.stdout)
+            self.assertEqual(profile.read_text(encoding="utf-8"), "plain\n")
+
 
 class TestSkeleton(unittest.TestCase):
     def test_imports_extensionless_executable(self):
