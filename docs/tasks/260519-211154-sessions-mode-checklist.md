@@ -50,13 +50,13 @@
 
 ### Stage 1. discovery/scope/CLI 기반 정리
 
-- [ ] 기존 xpane session discovery 로직 위치를 확인한다.
-- [ ] 기존 단일 session 상태/로그 모드 위치를 확인한다.
-- [ ] discovery를 sessions mode와 xpane이 공유할 수 있는 단위로 분리한다.
-- [ ] all scope와 `--current` scope를 구현한다.
-- [ ] `amon`, `amon --current`, `amon xpane`, `amon xpane --current`, `amon {session-id}` 라우팅을 구현한다.
-- [ ] session-id도 아니고 `xpane`도 아닌 기존식 인자는 `amon xpane ...` 안내 에러를 낸다.
-- [ ] CLI routing과 scope 단위 테스트를 추가하거나 갱신한다.
+- [x] 기존 xpane session discovery 로직 위치를 확인한다.
+- [x] 기존 단일 session 상태/로그 모드 위치를 확인한다.
+- [x] discovery를 sessions mode와 xpane이 공유할 수 있는 단위로 분리한다.
+- [x] all scope와 `--current` scope를 구현한다.
+- [x] `amon`, `amon --current`, `amon xpane`, `amon xpane --current`, `amon {session-id}` 라우팅을 구현한다.
+- [x] session-id도 아니고 `xpane`도 아닌 기존식 인자는 `amon xpane ...` 안내 에러를 낸다.
+- [x] CLI routing과 scope 단위 테스트를 추가하거나 갱신한다.
 
 커밋 기준: discovery/scope/CLI 변경과 관련 테스트만 포함한다.
 

@@ -23,6 +23,8 @@ UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
 )
+SCOPE_ALL = "all"
+SCOPE_CURRENT = "current"
 
 
 def cwd_to_claude_slug(cwd: str) -> str:
@@ -58,8 +60,16 @@ def _run_lsof(pid: int) -> str:
     return proc.stdout
 
 
-def resolve_claude_session_path(pid: int, cmdline: str = "") -> Optional[str]:
-    cwd = parse_lsof_cwd(_run_lsof(pid))
+def process_cwd(pid: int) -> Optional[str]:
+    return parse_lsof_cwd(_run_lsof(pid))
+
+
+def resolve_claude_session_path(
+    pid: int,
+    cmdline: str = "",
+    cwd: Optional[str] = None,
+) -> Optional[str]:
+    cwd = process_cwd(pid) if cwd is None else cwd
     if not cwd:
         return None
     directory = Path.home() / ".claude" / "projects" / cwd_to_claude_slug(cwd)
@@ -579,18 +589,59 @@ def is_codex_exec(cmdline: str) -> bool:
     return len(argv) >= 2 and os.path.basename(argv[0]) == "codex" and argv[1] == "exec"
 
 
-def discover_active_sessions(codex_all: bool = False) -> list[dict]:
+def _realpath(path: str) -> str:
+    return os.path.realpath(os.path.expanduser(path))
+
+
+def _is_path_at_or_under(path: str, root: str) -> bool:
+    path_real = _realpath(path)
+    root_real = _realpath(root)
+    try:
+        return os.path.commonpath([path_real, root_real]) == root_real
+    except ValueError:
+        return False
+
+
+def _scope_root(scope: str, cwd: Optional[str]) -> Optional[str]:
+    if scope == SCOPE_ALL:
+        return None
+    if scope == SCOPE_CURRENT:
+        return _realpath(cwd or os.getcwd())
+    raise ValueError(f"invalid discovery scope: {scope}")
+
+
+def _session_record(agent: str, pid: int, path: str, cwd: Optional[str] = None) -> dict:
+    session = {"agent": agent, "pid": pid, "path": path}
+    if cwd:
+        session["cwd"] = cwd
+    return session
+
+
+def discover_active_sessions(
+    codex_all: bool = False,
+    scope: str = SCOPE_ALL,
+    cwd: Optional[str] = None,
+) -> list[dict]:
+    root = _scope_root(scope, cwd)
     sessions: list[dict] = []
     for pid in candidate_pids(["claude", "codex"]):
         cmdline = process_command(pid)
+        current_cwd = None
+        if root is not None:
+            current_cwd = process_cwd(pid)
+            if not current_cwd or not _is_path_at_or_under(current_cwd, root):
+                continue
         if is_claude_noninteractive(cmdline):
-            path = resolve_claude_session_path(pid, cmdline=cmdline)
+            if current_cwd is None:
+                path = resolve_claude_session_path(pid, cmdline=cmdline)
+            else:
+                path = resolve_claude_session_path(pid, cmdline=cmdline, cwd=current_cwd)
             if path:
-                sessions.append({"agent": "claude", "pid": pid, "path": path})
+                sessions.append(_session_record("claude", pid, path, current_cwd))
             continue
         if is_codex_exec(cmdline):
             for path in resolve_codex_session_paths(pid, all_sessions=codex_all):
-                sessions.append({"agent": "codex", "pid": pid, "path": path})
+                sessions.append(_session_record("codex", pid, path, current_cwd))
     return sessions
 
 
@@ -649,6 +700,8 @@ def run_mode_b(
     idle_threshold: float,
     codex_all: bool,
     color: str = "always",
+    scope: str = SCOPE_ALL,
+    cwd: Optional[str] = None,
     *,
     output=None,
     error=None,
@@ -659,7 +712,7 @@ def run_mode_b(
         print("amon: xpanes is required for multi-session mode", file=err)
         return 3
 
-    sessions = discover_active_sessions(codex_all=codex_all)
+    sessions = discover_active_sessions(codex_all=codex_all, scope=scope, cwd=cwd)
     if not sessions:
         print("amon: no active non-interactive sessions found", file=err)
         return 0
@@ -673,6 +726,24 @@ def run_mode_b(
     )
     proc = subprocess.run([xpanes, "-t", "-c", template, *specs], check=False)
     return proc.returncode
+
+
+def run_sessions_mode(
+    idle_threshold: float,
+    codex_all: bool,
+    scope: str = SCOPE_ALL,
+    cwd: Optional[str] = None,
+    *,
+    output=None,
+    error=None,
+) -> int:
+    err = error or sys.stderr
+    discover_active_sessions(codex_all=codex_all, scope=scope, cwd=cwd)
+    print(
+        "amon: sessions list TUI is not implemented yet; use 'amon xpane' for pane mode",
+        file=err,
+    )
+    return 1
 
 
 def infer_agent_from_path(path: str) -> str:
@@ -698,11 +769,19 @@ def build_parser() -> argparse.ArgumentParser:
         description="Monitor active Claude and Codex automation sessions.",
         epilog=(
             "Modes:\n"
-            "  amon                         discover active non-interactive sessions and open xpanes\n"
-            "  amon --session-id ID          tail one resolved session\n"
-            "  amon --session-id ID --once   print one snapshot line and exit"
+            "  amon                         list active non-interactive sessions\n"
+            "  amon --current               list sessions under the current cwd\n"
+            "  amon xpane                   open the existing xpanes view\n"
+            "  amon xpane --current         open xpanes for sessions under the current cwd\n"
+            "  amon ID                      tail one resolved session"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("targets", nargs="*", help="session id to monitor, or 'xpane'")
+    parser.add_argument(
+        "--current",
+        action="store_true",
+        help="limit discovery modes to sessions whose process cwd is under this cwd",
     )
     parser.add_argument("--session-id", help="Claude or Codex session id to monitor")
     parser.add_argument("--once", action="store_true", help="print one snapshot line and exit")
@@ -730,9 +809,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _direct_session_args(args) -> bool:
+    return bool(args.session_id or args.session_path or args.session_spec)
+
+
+def _scope_from_args(args) -> str:
+    return SCOPE_CURRENT if args.current else SCOPE_ALL
+
+
+def _print_unknown_target_error(target: str, error=None) -> None:
+    err = error or sys.stderr
+    print(f"amon: unknown session id or mode: {target}", file=err)
+    print("amon: use 'amon xpane ...' for the existing xpanes pane mode", file=err)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    scope = _scope_from_args(args)
+    targets = args.targets
+
+    if targets and _direct_session_args(args):
+        parser.error("positional target cannot be combined with direct session options")
 
     if args.session_title:
         try:
@@ -742,16 +840,33 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 1
         return 0
 
-    if not (args.session_id or args.session_path or args.session_spec):
+    if len(targets) == 1 and targets[0] == "xpane":
         return run_mode_b(
             args.idle_threshold,
             codex_all=args.codex_all_sessions,
             color="always",
+            scope=scope,
         )
 
     color = args.color or "never"
     pid = args.pid
-    if args.session_spec:
+    if targets:
+        target = " ".join(targets)
+        if len(targets) != 1:
+            _print_unknown_target_error(target)
+            return 1
+        session_path = resolve_path_from_session_id(target)
+        if not session_path:
+            _print_unknown_target_error(target)
+            return 1
+        agent = infer_agent_from_path(session_path)
+    elif not _direct_session_args(args):
+        return run_sessions_mode(
+            args.idle_threshold,
+            codex_all=args.codex_all_sessions,
+            scope=scope,
+        )
+    elif args.session_spec:
         try:
             spec = decode_session_spec(args.session_spec)
         except ValueError as exc:
