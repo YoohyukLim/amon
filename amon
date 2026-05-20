@@ -1832,8 +1832,19 @@ def _list_row_width(layout: ListColumnLayout, label_width: int) -> int:
     return sum(column_width for column_width, _ in columns) + len(columns) - 1
 
 
-def _list_column_layout(width: int) -> ListColumnLayout:
-    layout = ListColumnLayout(project_width=LIST_PROJECT_WIDTH, label_width=0)
+def _list_project_width(entries: list[SessionEntry]) -> int:
+    project_widths = [_display_width(entry.project_display) for entry in entries]
+    content_width = max([_display_width("project"), *project_widths])
+    return min(LIST_PROJECT_WIDTH, max(LIST_PROJECT_MIN_WIDTH, content_width))
+
+
+def _list_column_layout(
+    width: int,
+    *,
+    project_width: int = LIST_PROJECT_WIDTH,
+) -> ListColumnLayout:
+    project_width = min(LIST_PROJECT_WIDTH, max(LIST_PROJECT_MIN_WIDTH, project_width))
+    layout = ListColumnLayout(project_width=project_width, label_width=0)
 
     while True:
         label_width = width - _list_row_width(layout, 0)
@@ -2060,22 +2071,19 @@ def _allocated_group_row_windows(
     return windows
 
 
-def _render_session_group_body(
+def _session_group_body_blocks(
     groups: list[tuple[str, str, list[SessionEntry]]],
     *,
     cursor: int,
     row_budget: int,
-    current: float,
-    wall_now: float,
-    layout: ListColumnLayout,
-) -> list[RenderLine]:
+) -> list[tuple[int, int, int]]:
     if row_budget <= 0 or not groups:
         return []
 
     if not flatten_status_groups(groups):
         return [
-            RenderLine(f"{title} (0)", "subtle", status=status)
-            for status, title, _entries in groups[:row_budget]
+            (group_index, 0, 0)
+            for group_index in range(min(row_budget, len(groups)))
         ]
 
     selected_group, selected_entry = _selected_group_position(groups, cursor)
@@ -2087,48 +2095,21 @@ def _render_session_group_body(
             selected_entry=selected_entry,
             row_capacity=row_budget - len(groups),
         )
-        body = []
-        for group_index, (status, title, entries) in enumerate(groups):
-            row_start, row_count = windows[group_index]
-            body.extend(
-                _render_session_group_block(
-                    status,
-                    title,
-                    entries,
-                    row_start=row_start,
-                    row_count=row_count,
-                    selected_group_index=selected_group,
-                    selected_entry_index=selected_entry,
-                    group_index=group_index,
-                    current=current,
-                    wall_now=wall_now,
-                    layout=layout,
-                )
-            )
-        return body[:row_budget]
+        return [
+            (group_index, *windows[group_index])
+            for group_index in range(len(groups))
+        ]
 
-    status, title, entries = groups[selected_group]
+    _status, _title, entries = groups[selected_group]
     selected_rows_budget = row_budget - 1
     row_start = min(selected_entry, max(0, len(entries) - selected_rows_budget))
     row_count = min(len(entries) - row_start, selected_rows_budget)
-    body = _render_session_group_block(
-        status,
-        title,
-        entries,
-        row_start=row_start,
-        row_count=row_count,
-        selected_group_index=selected_group,
-        selected_entry_index=selected_entry,
-        group_index=selected_group,
-        current=current,
-        wall_now=wall_now,
-        layout=layout,
-    )
+    blocks = [(selected_group, row_start, row_count)]
 
-    remaining = row_budget - len(body)
+    remaining = row_budget - (1 + row_count)
     group_index = selected_group + 1
     while remaining > 0 and group_index < len(groups):
-        status, title, entries = groups[group_index]
+        _status, _title, entries = groups[group_index]
         minimum_lines = 1 + (1 if entries else 0)
         if not entries and remaining <= _minimum_nonempty_group_lines(
             groups[group_index + 1 :]
@@ -2138,27 +2119,13 @@ def _render_session_group_body(
         if remaining < minimum_lines:
             break
         row_count = min(len(entries), remaining - 1)
-        body.extend(
-            _render_session_group_block(
-                status,
-                title,
-                entries,
-                row_start=0,
-                row_count=row_count,
-                selected_group_index=selected_group,
-                selected_entry_index=selected_entry,
-                group_index=group_index,
-                current=current,
-                wall_now=wall_now,
-                layout=layout,
-            )
-        )
-        remaining = row_budget - len(body)
+        blocks.append((group_index, 0, row_count))
+        remaining -= 1 + row_count
         group_index += 1
 
     group_index = selected_group - 1
     while remaining > 0 and group_index >= 0:
-        status, title, entries = groups[group_index]
+        _status, _title, entries = groups[group_index]
         minimum_lines = 1 + (1 if entries else 0)
         if not entries and remaining <= _minimum_nonempty_group_lines(
             groups[:group_index]
@@ -2169,7 +2136,52 @@ def _render_session_group_body(
             break
         row_count = min(len(entries), remaining - 1)
         row_start = len(entries) - row_count
-        body = (
+        blocks = [(group_index, row_start, row_count)] + blocks
+        remaining -= 1 + row_count
+        group_index -= 1
+
+    return blocks
+
+
+def _session_group_body_entries(
+    groups: list[tuple[str, str, list[SessionEntry]]],
+    blocks: list[tuple[int, int, int]],
+) -> list[SessionEntry]:
+    entries: list[SessionEntry] = []
+    for group_index, row_start, row_count in blocks:
+        group_entries = groups[group_index][2]
+        entries.extend(group_entries[row_start : row_start + row_count])
+    return entries
+
+
+def _render_session_group_body(
+    groups: list[tuple[str, str, list[SessionEntry]]],
+    *,
+    cursor: int,
+    row_budget: int,
+    current: float,
+    wall_now: float,
+    layout: ListColumnLayout,
+    blocks: Optional[list[tuple[int, int, int]]] = None,
+) -> list[RenderLine]:
+    if blocks is None:
+        blocks = _session_group_body_blocks(
+            groups,
+            cursor=cursor,
+            row_budget=row_budget,
+        )
+    if not blocks:
+        return []
+
+    if flatten_status_groups(groups):
+        selected_group, selected_entry = _selected_group_position(groups, cursor)
+    else:
+        selected_group, selected_entry = 0, 0
+
+    body = []
+    for group_index, row_start, row_count in blocks:
+        status, title, entries = groups[group_index]
+        body.extend(
             _render_session_group_block(
                 status,
                 title,
@@ -2183,12 +2195,9 @@ def _render_session_group_body(
                 wall_now=wall_now,
                 layout=layout,
             )
-            + body
         )
-        remaining = row_budget - len(body)
-        group_index -= 1
 
-    return body
+    return body[:row_budget]
 
 
 def render_session_list_layout(
@@ -2204,7 +2213,21 @@ def render_session_list_layout(
     total = len(visible)
     hidden = len(state.hidden_session_ids)
     search = f"/{state.query}" if state.query else "-"
-    layout = _list_column_layout(width)
+    header_line_count = 3
+    row_budget = max(0, height - header_line_count - 1)
+    cursor = min(
+        state.cursor,
+        max(0, len(flatten_status_groups(groups)) - 1),
+    )
+    body_blocks = _session_group_body_blocks(
+        groups,
+        cursor=cursor,
+        row_budget=row_budget,
+    )
+    project_width = _list_project_width(
+        _session_group_body_entries(groups, body_blocks)
+    )
+    layout = _list_column_layout(width, project_width=project_width)
     header_prefix = f"amon sessions total={total} "
     header_counts = _session_counts_label(counts, current)
     lines = [
@@ -2238,9 +2261,7 @@ def render_session_list_layout(
         ),
     ]
 
-    row_budget = max(0, height - len(lines) - 1)
     if row_budget:
-        cursor = min(state.cursor, max(0, len(flatten_status_groups(groups)) - 1))
         wall_now = time.time()
         lines.extend(
             _render_session_group_body(
@@ -2250,6 +2271,7 @@ def render_session_list_layout(
                 current=current,
                 wall_now=wall_now,
                 layout=layout,
+                blocks=body_blocks,
             )
         )
 

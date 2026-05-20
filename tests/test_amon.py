@@ -1640,6 +1640,9 @@ class TestSessionListState(unittest.TestCase):
         agent_col = table_header.index("agent")
         return agent_col - amon.LIST_STATUS_WIDTH - 1, agent_col
 
+    def _project_column_bounds(self, table_header):
+        return table_header.index("project"), table_header.index("label")
+
     def test_merge_search_hide_and_render_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             active = self._write_jsonl(
@@ -1758,6 +1761,93 @@ class TestSessionListState(unittest.TestCase):
         self.assertTrue(attr & amon.curses.A_REVERSE)
         self.assertTrue(attr & amon.curses.A_UNDERLINE)
         self.assertFalse(attr & amon.curses.A_BOLD)
+
+    def test_session_list_project_column_uses_rendered_short_project_width(self):
+        state = amon.SessionListState()
+        state.entries["short"] = amon.SessionEntry(
+            session_id="short-session",
+            agent="codex",
+            path="/tmp/short.jsonl",
+            status="running",
+            label="Short Label",
+            project_display="amon",
+            activity_mtime=200,
+        )
+        state.entries["offscreen-long"] = amon.SessionEntry(
+            session_id="offscreen-long",
+            agent="codex",
+            path="/tmp/offscreen-long.jsonl",
+            status="running",
+            label="Offscreen Label",
+            project_display="project-with-name-past-cap",
+            activity_mtime=100,
+        )
+
+        layout = amon.render_session_list_layout(state, width=120, height=6, now=10)
+
+        header = layout[2].text
+        row = next(line.text for line in layout if line.style == "row")
+        project_col, label_col = self._project_column_bounds(header)
+
+        self.assertEqual(label_col - project_col - 1, amon.LIST_PROJECT_MIN_WIDTH)
+        self.assertLess(label_col - project_col - 1, amon.LIST_PROJECT_WIDTH)
+        self.assertEqual(row[project_col:label_col].strip(), "amon")
+        self.assertEqual(row.index("Short Label"), label_col)
+
+    def test_session_list_project_column_expands_to_mixed_rendered_projects(self):
+        state = amon.SessionListState()
+        state.entries["long"] = amon.SessionEntry(
+            session_id="long-session",
+            agent="codex",
+            path="/tmp/long.jsonl",
+            status="running",
+            label="Long Label",
+            project_display="service-api",
+            activity_mtime=200,
+        )
+        state.entries["short"] = amon.SessionEntry(
+            session_id="short-session",
+            agent="codex",
+            path="/tmp/short.jsonl",
+            status="running",
+            label="Short Label",
+            project_display="amon",
+            activity_mtime=100,
+        )
+
+        layout = amon.render_session_list_layout(state, width=120, height=10, now=10)
+
+        header = layout[2].text
+        rows = [line.text for line in layout if line.style == "row"]
+        project_col, label_col = self._project_column_bounds(header)
+
+        self.assertEqual(label_col - project_col - 1, len("service-api"))
+        self.assertEqual(header[project_col:label_col].strip(), "project")
+        self.assertEqual(rows[0][project_col:label_col].strip(), "service-api")
+        self.assertEqual(rows[1][project_col:label_col].strip(), "amon")
+        self.assertEqual(rows[0].index("Long Label"), label_col)
+        self.assertEqual(rows[1].index("Short Label"), label_col)
+
+    def test_session_list_project_column_caps_long_rendered_project(self):
+        state = amon.SessionListState()
+        state.entries["long"] = amon.SessionEntry(
+            session_id="long-session",
+            agent="codex",
+            path="/tmp/long.jsonl",
+            status="running",
+            label="Capped Label",
+            project_display="project-with-name-past-cap",
+            activity_mtime=200,
+        )
+
+        layout = amon.render_session_list_layout(state, width=120, height=6, now=10)
+
+        header = layout[2].text
+        row = next(line.text for line in layout if line.style == "row")
+        project_col, label_col = self._project_column_bounds(header)
+
+        self.assertEqual(label_col - project_col - 1, amon.LIST_PROJECT_WIDTH)
+        self.assertEqual(row.index("Capped Label"), label_col)
 
     def test_session_list_layout_uses_single_rows_with_aligned_truncating_columns(self):
         state = amon.SessionListState()
