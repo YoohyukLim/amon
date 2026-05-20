@@ -271,6 +271,7 @@ class TestCliWiring(unittest.TestCase):
             scope=amon.SCOPE_ALL,
             lines=amon.DEFAULT_DETAIL_LINES,
             color="auto",
+            inline_only=False,
         )
 
     def test_main_current_calls_sessions_mode_current_scope(self):
@@ -283,6 +284,20 @@ class TestCliWiring(unittest.TestCase):
             scope=amon.SCOPE_CURRENT,
             lines=amon.DEFAULT_DETAIL_LINES,
             color="auto",
+            inline_only=False,
+        )
+
+    def test_main_inline_only_calls_sessions_mode(self):
+        with mock.patch.object(amon, "run_sessions_mode", return_value=0) as sessions_mode:
+            code = amon.main(["-i"])
+        self.assertEqual(code, 0)
+        sessions_mode.assert_called_once_with(
+            60.0,
+            codex_all=False,
+            scope=amon.SCOPE_ALL,
+            lines=amon.DEFAULT_DETAIL_LINES,
+            color="auto",
+            inline_only=True,
         )
 
     def test_main_lines_passes_to_sessions_mode(self):
@@ -295,6 +310,7 @@ class TestCliWiring(unittest.TestCase):
             scope=amon.SCOPE_ALL,
             lines=25,
             color="auto",
+            inline_only=False,
         )
 
     def test_main_lines_rejects_non_positive_values(self):
@@ -312,6 +328,7 @@ class TestCliWiring(unittest.TestCase):
             codex_all=False,
             color="always",
             scope=amon.SCOPE_ALL,
+            inline_only=False,
         )
 
     def test_main_xpane_current_calls_mode_b_current_scope(self):
@@ -323,6 +340,19 @@ class TestCliWiring(unittest.TestCase):
             codex_all=False,
             color="always",
             scope=amon.SCOPE_CURRENT,
+            inline_only=False,
+        )
+
+    def test_main_xpane_inline_only_calls_mode_b(self):
+        with mock.patch.object(amon, "run_mode_b", return_value=0) as mode_b:
+            code = amon.main(["xpane", "-i"])
+        self.assertEqual(code, 0)
+        mode_b.assert_called_once_with(
+            60.0,
+            codex_all=False,
+            color="always",
+            scope=amon.SCOPE_ALL,
+            inline_only=True,
         )
 
     def test_main_positional_session_id_opens_detail(self):
@@ -340,6 +370,22 @@ class TestCliWiring(unittest.TestCase):
             lines=amon.DEFAULT_DETAIL_LINES,
             color="auto",
         )
+
+    def test_main_inline_only_rejects_positional_session_id_mode(self):
+        err = io.StringIO()
+        with mock.patch.object(amon.sys, "stderr", err):
+            with self.assertRaises(SystemExit) as caught:
+                amon.main(["-i", "abcdef"])
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("--inline-only cannot be used with session id mode", err.getvalue())
+
+    def test_main_inline_only_rejects_direct_session_id_mode(self):
+        err = io.StringIO()
+        with mock.patch.object(amon.sys, "stderr", err):
+            with self.assertRaises(SystemExit) as caught:
+                amon.main(["--session-id", "abcdef", "--inline-only"])
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("--inline-only cannot be combined with direct session options", err.getvalue())
 
     def test_main_unknown_positional_target_points_to_xpane(self):
         err = io.StringIO()
@@ -1364,22 +1410,135 @@ class TestDiscovery(unittest.TestCase):
         self.assertFalse(amon.is_claude_noninteractive("claude"))
         self.assertFalse(amon.is_claude_noninteractive("claude --resume abc123"))
 
+    def test_claude_agent_accepts_interactive_and_noninteractive(self):
+        self.assertTrue(amon.is_claude_agent("claude"))
+        self.assertTrue(amon.is_claude_agent("claude --resume abc123"))
+        self.assertTrue(amon.is_claude_agent("/opt/bin/claude -p hello"))
+        self.assertFalse(amon.is_claude_agent("python worker.py"))
+        self.assertFalse(amon.is_claude_agent("claude doctor"))
+        self.assertFalse(amon.is_claude_agent("claude --help"))
+
     def test_codex_exec_accepts_direct_vendor_command_only(self):
         self.assertTrue(amon.is_codex_exec("/opt/homebrew/bin/codex exec run this"))
         self.assertFalse(amon.is_codex_exec("/usr/bin/node /pkg/codex exec run this"))
         self.assertFalse(amon.is_codex_exec("codex app-server"))
         self.assertFalse(amon.is_codex_exec("codex"))
 
-    def test_discover_active_sessions_uses_filters_and_resolvers(self):
+    def test_codex_agent_accepts_interactive_and_exec_but_not_app_server(self):
+        self.assertTrue(amon.is_codex_agent("codex"))
+        self.assertTrue(amon.is_codex_agent("codex exec run this"))
+        self.assertFalse(amon.is_codex_agent("codex app-server"))
+        self.assertFalse(amon.is_codex_agent("codex --help"))
+        self.assertFalse(amon.is_codex_agent("/usr/bin/node /pkg/codex exec run this"))
+
+    def test_discover_active_sessions_uses_agent_filters_and_resolvers(self):
         commands = {
             1: "claude -p hello",
             2: "claude --resume abc",
             3: "codex exec run",
             4: "codex app-server",
+            5: "codex",
         }
         cwds = {
             1: "/repo/claude",
+            2: "/repo/claude-interactive",
             3: "/repo/codex",
+            5: "/repo/codex-interactive",
+        }
+        claude_paths = {
+            1: "/tmp/claude-inline.jsonl",
+            2: "/tmp/claude-interactive.jsonl",
+        }
+        codex_paths = {
+            3: ["/tmp/codex-a.jsonl", "/tmp/codex-b.jsonl"],
+            5: ["/tmp/codex-interactive.jsonl"],
+        }
+        with mock.patch.object(amon, "candidate_pids", return_value=[1, 2, 3, 4, 5]):
+            with mock.patch.object(amon, "process_command", side_effect=lambda pid: commands[pid]):
+                with mock.patch.object(amon, "process_cwd", side_effect=lambda pid: cwds[pid]):
+                    with mock.patch.object(
+                        amon,
+                        "resolve_claude_session_path",
+                        side_effect=lambda pid, **_kwargs: claude_paths[pid],
+                    ) as claude_resolver:
+                        with mock.patch.object(
+                            amon,
+                            "resolve_codex_session_paths",
+                            side_effect=lambda pid, all_sessions=False: codex_paths[pid],
+                        ) as codex_resolver:
+                            sessions = amon.discover_active_sessions(codex_all=True)
+        self.assertEqual(
+            sessions,
+            [
+                {
+                    "agent": "claude",
+                    "pid": 1,
+                    "path": "/tmp/claude-inline.jsonl",
+                    "inline": True,
+                    "cwd": "/repo/claude",
+                    "command": "claude -p hello",
+                },
+                {
+                    "agent": "claude",
+                    "pid": 2,
+                    "path": "/tmp/claude-interactive.jsonl",
+                    "inline": False,
+                    "cwd": "/repo/claude-interactive",
+                    "command": "claude --resume abc",
+                },
+                {
+                    "agent": "codex",
+                    "pid": 3,
+                    "path": "/tmp/codex-a.jsonl",
+                    "inline": True,
+                    "cwd": "/repo/codex",
+                    "command": "codex exec run",
+                },
+                {
+                    "agent": "codex",
+                    "pid": 3,
+                    "path": "/tmp/codex-b.jsonl",
+                    "inline": True,
+                    "cwd": "/repo/codex",
+                    "command": "codex exec run",
+                },
+                {
+                    "agent": "codex",
+                    "pid": 5,
+                    "path": "/tmp/codex-interactive.jsonl",
+                    "inline": False,
+                    "cwd": "/repo/codex-interactive",
+                    "command": "codex",
+                },
+            ],
+        )
+        self.assertEqual(
+            claude_resolver.call_args_list,
+            [
+                mock.call(1, cmdline="claude -p hello", cwd="/repo/claude"),
+                mock.call(2, cmdline="claude --resume abc", cwd="/repo/claude-interactive"),
+            ],
+        )
+        self.assertEqual(
+            codex_resolver.call_args_list,
+            [
+                mock.call(3, all_sessions=True),
+                mock.call(5, all_sessions=True),
+            ],
+        )
+
+    def test_discover_active_sessions_inline_only_skips_interactive_agents(self):
+        commands = {
+            1: "claude -p hello",
+            2: "claude --resume abc",
+            3: "codex exec run",
+            4: "codex",
+        }
+        cwds = {
+            1: "/repo/claude",
+            2: "/repo/claude-interactive",
+            3: "/repo/codex",
+            4: "/repo/codex-interactive",
         }
         with mock.patch.object(amon, "candidate_pids", return_value=[1, 2, 3, 4]):
             with mock.patch.object(amon, "process_command", side_effect=lambda pid: commands[pid]):
@@ -1392,9 +1551,12 @@ class TestDiscovery(unittest.TestCase):
                         with mock.patch.object(
                             amon,
                             "resolve_codex_session_paths",
-                            return_value=["/tmp/codex-a.jsonl", "/tmp/codex-b.jsonl"],
+                            return_value=["/tmp/codex.jsonl"],
                         ) as codex_resolver:
-                            sessions = amon.discover_active_sessions(codex_all=True)
+                            sessions = amon.discover_active_sessions(
+                                codex_all=True,
+                                inline_only=True,
+                            )
         self.assertEqual(
             sessions,
             [
@@ -1402,30 +1564,21 @@ class TestDiscovery(unittest.TestCase):
                     "agent": "claude",
                     "pid": 1,
                     "path": "/tmp/claude.jsonl",
+                    "inline": True,
                     "cwd": "/repo/claude",
                     "command": "claude -p hello",
                 },
                 {
                     "agent": "codex",
                     "pid": 3,
-                    "path": "/tmp/codex-a.jsonl",
-                    "cwd": "/repo/codex",
-                    "command": "codex exec run",
-                },
-                {
-                    "agent": "codex",
-                    "pid": 3,
-                    "path": "/tmp/codex-b.jsonl",
+                    "path": "/tmp/codex.jsonl",
+                    "inline": True,
                     "cwd": "/repo/codex",
                     "command": "codex exec run",
                 },
             ],
         )
-        claude_resolver.assert_called_once_with(
-            1,
-            cmdline="claude -p hello",
-            cwd="/repo/claude",
-        )
+        claude_resolver.assert_called_once_with(1, cmdline="claude -p hello", cwd="/repo/claude")
         codex_resolver.assert_called_once_with(3, all_sessions=True)
 
     def test_discover_active_sessions_all_scope_preserves_cwd_for_project_render(self):
@@ -1500,6 +1653,7 @@ class TestDiscovery(unittest.TestCase):
                     "agent": "claude",
                     "pid": 1,
                     "path": "/tmp/claude.jsonl",
+                    "inline": True,
                     "cwd": "/repo",
                     "command": "claude -p hello",
                 },
@@ -1507,6 +1661,7 @@ class TestDiscovery(unittest.TestCase):
                     "agent": "codex",
                     "pid": 2,
                     "path": "/tmp/codex.jsonl",
+                    "inline": True,
                     "cwd": "/repo/sub",
                     "command": "codex exec run",
                 },
@@ -1595,10 +1750,12 @@ class TestSessionAggregation(unittest.TestCase):
         self.assertEqual(amon.representative_status(["running", "failed"]), "failed")
         self.assertEqual(same.label, "Release watcher")
         self.assertIn("claude -p release", same.search_text)
+        self.assertTrue(same.inline)
         self.assertEqual(same.status_counts["failed"], 1)
         self.assertEqual(same.status_counts["running"], 1)
         self.assertEqual(solo.status, "running")
         self.assertEqual(solo.label, "codex exec inspect")
+        self.assertTrue(solo.inline)
         self.assertEqual(amon.count_session_statuses(entries)["failed"], 1)
         self.assertEqual(amon.count_session_statuses(entries)["running"], 1)
         self.assertLess(entries.index(same), entries.index(solo))
@@ -1738,6 +1895,60 @@ class TestSessionListState(unittest.TestCase):
             label="Session",
         )
         self.assertEqual(amon.handle_session_list_key(state, "ENTER"), "detail")
+
+    def test_inline_only_toggle_filters_entries_and_preserves_visible_selection(self):
+        state = amon.SessionListState()
+        state.entries["interactive"] = amon.SessionEntry(
+            session_id="interactive",
+            agent="codex",
+            path="/tmp/interactive.jsonl",
+            status="running",
+            label="Interactive",
+            activity_mtime=300,
+            inline=False,
+        )
+        state.entries["inline"] = amon.SessionEntry(
+            session_id="inline",
+            agent="codex",
+            path="/tmp/inline.jsonl",
+            status="running",
+            label="Inline",
+            activity_mtime=100,
+            inline=True,
+        )
+
+        self.assertEqual(state.selected_entry().session_id, "interactive")
+        self.assertIsNone(amon.handle_session_list_key(state, "i"))
+        self.assertTrue(state.inline_only)
+        self.assertEqual([entry.session_id for entry in state.visible_entries()], ["inline"])
+        self.assertEqual(state.selected_entry().session_id, "inline")
+        self.assertIn("Inline only on", state.status_message)
+
+        self.assertIsNone(amon.handle_session_list_key(state, "i"))
+        self.assertFalse(state.inline_only)
+        self.assertEqual(state.selected_entry().session_id, "inline")
+        self.assertIn("Inline only off", state.status_message)
+
+    def test_initial_inline_only_filters_visible_entries(self):
+        state = amon.SessionListState(inline_only=True)
+        state.entries["interactive"] = amon.SessionEntry(
+            session_id="interactive",
+            agent="claude",
+            path="/tmp/interactive.jsonl",
+            status="running",
+            label="Interactive",
+            inline=False,
+        )
+        state.entries["inline"] = amon.SessionEntry(
+            session_id="inline",
+            agent="claude",
+            path="/tmp/inline.jsonl",
+            status="running",
+            label="Inline",
+            inline=True,
+        )
+
+        self.assertEqual([entry.session_id for entry in state.visible_entries()], ["inline"])
 
     def test_session_list_layout_carries_status_selection_and_new_highlight(self):
         state = amon.SessionListState()
@@ -2579,7 +2790,12 @@ class TestModeBLauncher(unittest.TestCase):
                 code = amon.run_mode_b(30, codex_all=False, error=err)
         self.assertEqual(code, 0)
         self.assertIn("no active", err.getvalue())
-        discover.assert_called_once_with(codex_all=False, scope=amon.SCOPE_ALL, cwd=None)
+        discover.assert_called_once_with(
+            codex_all=False,
+            scope=amon.SCOPE_ALL,
+            cwd=None,
+            inline_only=False,
+        )
 
     def test_run_mode_b_current_scope_passes_scope_to_discovery(self):
         err = io.StringIO()
@@ -2597,6 +2813,21 @@ class TestModeBLauncher(unittest.TestCase):
             codex_all=True,
             scope=amon.SCOPE_CURRENT,
             cwd="/repo",
+            inline_only=False,
+        )
+
+    def test_run_mode_b_inline_only_passes_filter_to_discovery(self):
+        err = io.StringIO()
+        with mock.patch.object(amon.shutil, "which", return_value="/opt/homebrew/bin/xpanes"):
+            with mock.patch.object(amon, "discover_active_sessions", return_value=[]) as discover:
+                code = amon.run_mode_b(30, codex_all=False, inline_only=True, error=err)
+        self.assertEqual(code, 0)
+        self.assertIn("no active inline agent sessions", err.getvalue())
+        discover.assert_called_once_with(
+            codex_all=False,
+            scope=amon.SCOPE_ALL,
+            cwd=None,
+            inline_only=True,
         )
 
     def test_run_mode_b_xpanes_command_shape(self):

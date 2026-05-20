@@ -1,7 +1,7 @@
 # ADR: Discovery 는 non-interactive 세션만 대상
 
 - Date: 2026-05-18
-- Status: Accepted
+- Status: Superseded by [260520-093830-discovery-all-agents-inline-filter.md](./260520-093830-discovery-all-agents-inline-filter.md)
 
 ## Context
 

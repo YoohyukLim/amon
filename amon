@@ -68,6 +68,19 @@ SESSION_HIGHLIGHT_SECONDS = 3.0
 DEFAULT_DETAIL_LINES = 200
 DETAIL_DIRECT_EXIT_KEYS = ("q",)
 DETAIL_LIST_DETAIL_EXIT_KEYS = ("q", "BACKSPACE", "ESC")
+CLAUDE_NON_AGENT_COMMANDS = {"config", "doctor", "help", "mcp", "update"}
+CLAUDE_NON_AGENT_FLAGS = {"--help", "-h", "--version", "-v"}
+CODEX_NON_AGENT_COMMANDS = {
+    "app-server",
+    "completion",
+    "debug",
+    "help",
+    "login",
+    "logout",
+    "mcp",
+    "server",
+}
+CODEX_NON_AGENT_FLAGS = {"--help", "-h", "--version", "-V"}
 TUI_COLOR_PAIRS = {
     "header": 1,
     "subtle": 2,
@@ -126,6 +139,7 @@ class SessionEntry:
         activity_mtime: Optional[float] = None,
         paths: tuple[str, ...] = (),
         pids: tuple[int, ...] = (),
+        inline: bool = False,
         status_counts: Optional[dict[str, int]] = None,
         first_seen: float = 0.0,
         last_seen: float = 0.0,
@@ -144,6 +158,7 @@ class SessionEntry:
         self.activity_mtime = activity_mtime
         self.paths = paths
         self.pids = pids
+        self.inline = inline
         self.status_counts = status_counts or {
             status: (1 if status == self.status else 0) for status in SESSION_STATUSES
         }
@@ -728,9 +743,39 @@ def is_claude_noninteractive(cmdline: str) -> bool:
     return False
 
 
+def is_claude_agent(cmdline: str) -> bool:
+    argv = _split_cmdline(cmdline)
+    for idx, arg in enumerate(argv):
+        if os.path.basename(arg) != "claude":
+            continue
+        args = argv[idx + 1 :]
+        if not args:
+            return True
+        first = args[0]
+        return first not in CLAUDE_NON_AGENT_COMMANDS and first not in CLAUDE_NON_AGENT_FLAGS
+    return False
+
+
 def is_codex_exec(cmdline: str) -> bool:
     argv = _split_cmdline(cmdline)
     return len(argv) >= 2 and os.path.basename(argv[0]) == "codex" and argv[1] == "exec"
+
+
+def is_codex_agent(cmdline: str) -> bool:
+    argv = _split_cmdline(cmdline)
+    if not argv or os.path.basename(argv[0]) != "codex":
+        return False
+    if len(argv) == 1:
+        return True
+    return argv[1] not in CODEX_NON_AGENT_COMMANDS and argv[1] not in CODEX_NON_AGENT_FLAGS
+
+
+def is_inline_agent_command(cmdline: str, agent: str = "") -> bool:
+    if agent == "claude":
+        return is_claude_noninteractive(cmdline)
+    if agent == "codex":
+        return is_codex_exec(cmdline)
+    return is_claude_noninteractive(cmdline) or is_codex_exec(cmdline)
 
 
 def _realpath(path: str) -> str:
@@ -760,8 +805,9 @@ def _session_record(
     path: str,
     cwd: Optional[str] = None,
     command: str = "",
+    inline: bool = False,
 ) -> dict:
-    session = {"agent": agent, "pid": pid, "path": path}
+    session = {"agent": agent, "pid": pid, "path": path, "inline": inline}
     if cwd:
         session["cwd"] = cwd
     if command:
@@ -773,13 +819,14 @@ def discover_active_sessions(
     codex_all: bool = False,
     scope: str = SCOPE_ALL,
     cwd: Optional[str] = None,
+    inline_only: bool = False,
 ) -> list[dict]:
     root = _scope_root(scope, cwd)
     sessions: list[dict] = []
     for pid in candidate_pids(["claude", "codex"]):
         cmdline = process_command(pid)
-        claude_candidate = is_claude_noninteractive(cmdline)
-        codex_candidate = is_codex_exec(cmdline)
+        claude_candidate = is_claude_agent(cmdline)
+        codex_candidate = is_codex_agent(cmdline)
         if not claude_candidate and not codex_candidate:
             continue
 
@@ -788,16 +835,24 @@ def discover_active_sessions(
             if not current_cwd or not _is_path_at_or_under(current_cwd, root):
                 continue
         if claude_candidate:
+            inline = is_inline_agent_command(cmdline, "claude")
+            if inline_only and not inline:
+                continue
             if current_cwd is None:
                 path = resolve_claude_session_path(pid, cmdline=cmdline)
             else:
                 path = resolve_claude_session_path(pid, cmdline=cmdline, cwd=current_cwd)
             if path:
-                sessions.append(_session_record("claude", pid, path, current_cwd, cmdline))
+                sessions.append(
+                    _session_record("claude", pid, path, current_cwd, cmdline, inline)
+                )
             continue
         if codex_candidate:
+            inline = is_inline_agent_command(cmdline, "codex")
+            if inline_only and not inline:
+                continue
             for path in resolve_codex_session_paths(pid, all_sessions=codex_all):
-                sessions.append(_session_record("codex", pid, path, current_cwd, cmdline))
+                sessions.append(_session_record("codex", pid, path, current_cwd, cmdline, inline))
     return sessions
 
 
@@ -1146,6 +1201,12 @@ def aggregate_sessions(
 
         status = _session_record_status(session, summary, pid_alive_func=pid_alive_func)
         command = _clean_text(session.get("command")) or summary.command
+        inline_value = session.get("inline")
+        inline = (
+            bool(inline_value)
+            if inline_value is not None
+            else is_inline_agent_command(command, agent)
+        )
         pid = session.get("pid")
         group = groups.setdefault(
             session_id,
@@ -1158,6 +1219,7 @@ def aggregate_sessions(
                 "statuses": [],
                 "metadata_values": [],
                 "commands": [],
+                "inline": False,
                 "cwd": session.get("cwd"),
                 "activity_mtime": summary.activity_mtime,
             },
@@ -1167,6 +1229,8 @@ def aggregate_sessions(
             group["pids"].append(pid)
         group["statuses"].append(status)
         group["metadata_values"].extend(summary.metadata_values)
+        if inline:
+            group["inline"] = True
         if command:
             group["commands"].append(command)
         if not group["cwd"] and session.get("cwd"):
@@ -1201,6 +1265,7 @@ def aggregate_sessions(
                 activity_mtime=group["activity_mtime"],
                 paths=_unique_preserve_order(group["paths"]),
                 pids=tuple(sorted(set(group["pids"]))),
+                inline=group["inline"],
                 status_counts=status_counts,
             )
         )
@@ -1252,15 +1317,21 @@ def flatten_status_groups(
 
 
 class SessionListState:
-    def __init__(self, scope: str = SCOPE_ALL, cwd: Optional[str] = None):
+    def __init__(
+        self,
+        scope: str = SCOPE_ALL,
+        cwd: Optional[str] = None,
+        inline_only: bool = False,
+    ):
         self.scope = scope
         self.cwd = cwd
+        self.inline_only = inline_only
         self.entries: dict[str, SessionEntry] = {}
         self.hidden_session_ids: set[str] = set()
         self.query = ""
         self.searching = False
         self.cursor = 0
-        self.status_message = "Enter detail; q quits"
+        self.status_message = "Enter detail; i toggles inline; q quits"
 
     def merge_discovered(
         self,
@@ -1304,6 +1375,7 @@ class SessionListState:
             entry
             for entry in self.entries.values()
             if entry.session_id not in self.hidden_session_ids
+            and (not self.inline_only or entry.inline)
         ]
         return filter_session_entries(entries, self.query)
 
@@ -1329,6 +1401,23 @@ class SessionListState:
         self.status_message = f"hid {len(finished)} exited/failed session(s)"
         self._clamp_cursor()
         return len(finished)
+
+    def toggle_inline_only(self) -> None:
+        selected = self.selected_entry()
+        selected_id = selected.session_id if selected is not None else None
+        self.inline_only = not self.inline_only
+        if not (selected_id and self._move_cursor_to_session_id(selected_id)):
+            self.cursor = 0
+            self._clamp_cursor()
+        state = "on" if self.inline_only else "off"
+        self.status_message = f"Inline only {state}"
+
+    def _move_cursor_to_session_id(self, session_id: str) -> bool:
+        for idx, entry in enumerate(self.grouped_visible_entries()):
+            if entry.session_id == session_id:
+                self.cursor = idx
+                return True
+        return False
 
     def _clamp_cursor(self) -> None:
         visible_count = len(self.grouped_visible_entries())
@@ -1509,6 +1598,9 @@ def handle_session_list_key(state: SessionListState, key: str) -> Optional[str]:
         return None
     if key == "r":
         state.hide_visible_finished()
+        return None
+    if key == "i":
+        state.toggle_inline_only()
         return None
     if key == "UP":
         state.cursor = max(0, state.cursor - 1)
@@ -2213,6 +2305,7 @@ def render_session_list_layout(
     total = len(visible)
     hidden = len(state.hidden_session_ids)
     search = f"/{state.query}" if state.query else "-"
+    inline = "on" if state.inline_only else "off"
     header_line_count = 3
     row_budget = max(0, height - header_line_count - 1)
     cursor = min(
@@ -2241,7 +2334,7 @@ def render_session_list_layout(
         ),
         RenderLine(
             f"scope={state.scope} project={_scope_project_label(state.scope, state.cwd)} "
-            f"search={search} hidden={hidden}",
+            f"inline={inline} search={search} hidden={hidden}",
             "subtle",
         ),
         RenderLine(
@@ -2652,6 +2745,7 @@ def _run_sessions_tui(
     line_count: int = DEFAULT_DETAIL_LINES,
     poll_interval: float = 1.0,
     color: str = "auto",
+    inline_only: bool = False,
 ) -> int:
     try:
         curses.curs_set(0)
@@ -2660,7 +2754,7 @@ def _run_sessions_tui(
     color_enabled = _init_curses_colors(color)
     stdscr.timeout(100)
 
-    state = SessionListState(scope=scope, cwd=cwd)
+    state = SessionListState(scope=scope, cwd=cwd, inline_only=inline_only)
     next_poll = 0.0
 
     try:
@@ -2699,6 +2793,7 @@ def run_mode_b(
     color: str = "always",
     scope: str = SCOPE_ALL,
     cwd: Optional[str] = None,
+    inline_only: bool = False,
     *,
     output=None,
     error=None,
@@ -2709,9 +2804,15 @@ def run_mode_b(
         print("amon: xpanes is required for multi-session mode", file=err)
         return 3
 
-    sessions = discover_active_sessions(codex_all=codex_all, scope=scope, cwd=cwd)
+    sessions = discover_active_sessions(
+        codex_all=codex_all,
+        scope=scope,
+        cwd=cwd,
+        inline_only=inline_only,
+    )
     if not sessions:
-        print("amon: no active non-interactive sessions found", file=err)
+        kind = "inline agent" if inline_only else "agent"
+        print(f"amon: no active {kind} sessions found", file=err)
         return 0
 
     specs = [encode_session_spec(session) for session in sessions]
@@ -2732,13 +2833,14 @@ def run_sessions_mode(
     cwd: Optional[str] = None,
     lines: int = DEFAULT_DETAIL_LINES,
     color: str = "auto",
+    inline_only: bool = False,
     *,
     output=None,
     error=None,
 ) -> int:
     stream = output or sys.stdout
     if output is not None or not stream.isatty():
-        state = SessionListState(scope=scope, cwd=cwd)
+        state = SessionListState(scope=scope, cwd=cwd, inline_only=inline_only)
         state.merge_discovered(
             discover_active_sessions(codex_all=codex_all, scope=scope, cwd=cwd),
             time.monotonic(),
@@ -2755,6 +2857,7 @@ def run_sessions_mode(
             cwd=cwd,
             line_count=lines,
             color=color,
+            inline_only=inline_only,
         )
     )
 
@@ -2839,9 +2942,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Monitor active Claude and Codex automation sessions.",
         epilog=(
             "Modes:\n"
-            "  amon                         list active non-interactive sessions\n"
+            "  amon                         list active agent sessions\n"
             "  amon --current               list sessions under the current cwd\n"
+            "  amon -i                      list inline (non-interactive) sessions\n"
             "  amon xpane                   open the existing xpanes view\n"
+            "  amon xpane -i                open xpanes for inline sessions\n"
             "  amon xpane --current         open xpanes for sessions under the current cwd\n"
             "  amon ID                      open one resolved session detail view"
         ),
@@ -2864,7 +2969,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--codex-all-sessions",
         action="store_true",
-        help="monitor every Codex JSONL held by a discovered codex exec process",
+        help="monitor every Codex JSONL held by a discovered Codex process",
+    )
+    parser.add_argument(
+        "-i",
+        "--inline-only",
+        action="store_true",
+        help="show only inline (non-interactive) agent sessions in discovery modes",
     )
     parser.add_argument(
         "--lines",
@@ -2907,6 +3018,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if targets and _direct_session_args(args):
         parser.error("positional target cannot be combined with direct session options")
+    if args.inline_only:
+        if _direct_session_args(args):
+            parser.error("--inline-only cannot be combined with direct session options")
+        if targets and not (len(targets) == 1 and targets[0] == "xpane"):
+            parser.error("--inline-only cannot be used with session id mode")
 
     if args.session_title:
         try:
@@ -2922,6 +3038,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             codex_all=args.codex_all_sessions,
             color="always",
             scope=scope,
+            inline_only=args.inline_only,
         )
 
     tui_color = args.color or "auto"
@@ -2946,6 +3063,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             scope=scope,
             lines=args.lines,
             color=tui_color,
+            inline_only=args.inline_only,
         )
     elif args.session_spec:
         try:

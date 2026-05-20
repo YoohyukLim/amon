@@ -1,8 +1,8 @@
 # amon
 
-`amon` monitors non-interactive Claude and Codex sessions by tailing their JSONL
-session files. It is a single executable Python script and uses only the Python
-standard library.
+`amon` monitors Claude and Codex agent sessions by tailing their JSONL session
+files. It is a single executable Python script and uses only the Python standard
+library.
 
 ## Install
 
@@ -41,7 +41,7 @@ unchanged.
 
 ## Usage
 
-List active non-interactive Claude and Codex sessions:
+List active Claude and Codex agent sessions:
 
 ```bash
 amon
@@ -49,14 +49,22 @@ amon
 
 The default view is a sessions TUI. It refreshes discovery every second, groups
 rows by session id, and opens a session detail log with `Enter`. Use `/` to
-filter, `r` to hide visible finished sessions for the current run, and `q` to
-quit. On terminals with color support, the sessions TUI and detail views color
-statuses and tool lines by default; pass `--color=never` to keep them plain.
+filter, `i` to toggle Inline only, `r` to hide visible finished sessions for the
+current run, and `q` to quit. On terminals with color support, the sessions TUI
+and detail views color statuses and tool lines by default; pass `--color=never`
+to keep them plain.
 
 Limit discovery to sessions whose process cwd is under the current directory:
 
 ```bash
 amon --current
+```
+
+Show only inline (non-interactive) sessions in discovery views:
+
+```bash
+amon -i
+amon --inline-only
 ```
 
 Open one resolved session detail view:
@@ -86,10 +94,12 @@ Open the existing xpanes view:
 ```bash
 amon xpane
 amon xpane --current
+amon xpane -i
 ```
 
 `amon xpane` launches one pane per discovered session in the all scope.
 `amon xpane --current` applies the same cwd scope as `amon --current`. The
+`-i` / `--inline-only` option limits panes to inline sessions. The
 sessions TUI is the dynamic default; the xpane launcher builds its pane set when
 it starts.
 
@@ -106,12 +116,14 @@ the line also includes `pid=N`. Snapshot output is always plain text, even when
 ## Flags
 
 - `--current` limits discovery views to sessions under the current cwd.
+- `-i, --inline-only` shows only inline (non-interactive) agent sessions in
+  discovery views.
 - `--lines N` sets recent log lines loaded in session detail views.
 - `--session-id <id>` resolves a Claude or Codex session id.
 - `--once` prints a snapshot instead of opening the detail view.
 - `--idle-threshold N` sets the idle warning/status threshold in seconds.
-- `--codex-all-sessions` includes all open Codex session JSONLs in discovery
-  views.
+- `--codex-all-sessions` includes all open Codex session JSONLs per discovered
+  Codex process in discovery views.
 - `--color {always,never,auto}` controls color for TUI views and direct tail
   output. `--once` snapshots ignore it and stay plain.
 
