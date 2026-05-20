@@ -12,7 +12,7 @@ Claude session wrapper.
 
 Options:
   --bin-dir PATH          Directory to install the amon command into.
-                          Default: $AMON_BIN_DIR or ~/bin
+                          Default: $AMON_BIN_DIR or /usr/local/bin
   --name NAME             Installed command name. Default: amon
   --profile PATH          Shell profile for the Claude wrapper.
                           Default: $AMON_CLAUDE_PROFILE or ~/.bash_profile
@@ -23,7 +23,7 @@ Options:
 EOF
 }
 
-bin_dir="${AMON_BIN_DIR:-$HOME/bin}"
+bin_dir="${AMON_BIN_DIR:-/usr/local/bin}"
 command_name="${AMON_COMMAND_NAME:-amon}"
 profile="${AMON_CLAUDE_PROFILE:-$HOME/.bash_profile}"
 install_wrapper=1

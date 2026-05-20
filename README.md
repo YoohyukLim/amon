@@ -89,8 +89,12 @@ Install all local integration points with one command:
 By default this:
 
 - builds `dist/amon`
-- copies it to `~/bin/amon`
+- copies it to `/usr/local/bin/amon`
 - installs the Claude session wrapper into `~/.bash_profile`
+
+If `/usr/local/bin` is not writable, either choose a user-writable directory or
+run only the command install with elevated privileges. Avoid installing the
+Claude wrapper through `sudo`, because that can target root's shell profile.
 
 Use explicit paths when needed:
 
@@ -108,7 +112,7 @@ For a source-checkout installation, install a symlink to the root shim instead
 of copying the standalone artifact:
 
 ```bash
-./scripts/install.sh --source-symlink --bin-dir ~/bin
+./scripts/install.sh --source-symlink
 ```
 
 Do not copy the root `amon` shim by itself. If you want a copied single file,
@@ -121,15 +125,15 @@ onto your `PATH`:
 
 ```bash
 ./scripts/build-standalone.sh
-cp ./dist/amon ~/bin/amon
-chmod +x ~/bin/amon
+cp ./dist/amon /usr/local/bin/amon
+chmod +x /usr/local/bin/amon
 ```
 
 For a source-checkout installation, symlink the root shim so it can still find
 the checkout's `src/` package:
 
 ```bash
-ln -s "$(pwd)/amon" ~/bin/amon
+ln -s "$(pwd)/amon" /usr/local/bin/amon
 ```
 
 ### Claude Session Wrapper
@@ -160,7 +164,7 @@ Remove all local integration points with one command:
 ./scripts/uninstall.sh
 ```
 
-By default this removes `~/bin/amon` when it can identify that file as an
+By default this removes `/usr/local/bin/amon` when it can identify that file as an
 `amon` executable, then removes the managed Claude wrapper block from
 `~/.bash_profile`.
 

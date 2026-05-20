@@ -125,6 +125,18 @@ class TestClaudeSessionWrapperInstaller(unittest.TestCase):
 
 
 class TestInstallUninstallScripts(unittest.TestCase):
+    def test_install_scripts_default_to_usr_local_bin(self):
+        for script_name in ("install.sh", "uninstall.sh"):
+            proc = subprocess.run(
+                [str(ROOT / "scripts" / script_name), "--help"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("Default: $AMON_BIN_DIR or /usr/local/bin", proc.stdout)
+
     def test_install_and_uninstall_all_related_files(self):
         install_script = ROOT / "scripts" / "install.sh"
         uninstall_script = ROOT / "scripts" / "uninstall.sh"
