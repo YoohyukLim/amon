@@ -18,6 +18,20 @@ a Python standard-library-only package. Claude and Codex support live behind
 agent adapters, so future agents can be added by implementing a new adapter
 instead of rewriting the monitor, TUI, or xpanes launcher.
 
+## Quick Start
+
+Install and run with two commands from a fresh checkout:
+
+```bash
+./scripts/install.sh
+amon
+```
+
+`scripts/install.sh` builds `dist/amon`, copies it to `/usr/local/bin/amon`, and
+installs the Claude session wrapper into `~/.bash_profile`. Running `amon` then
+opens the sessions TUI for any active Claude or Codex agent sessions. See
+[Install Guide](#install-guide) and [Usage Guide](#usage-guide) for options.
+
 ## Requirements
 
 - Python 3
