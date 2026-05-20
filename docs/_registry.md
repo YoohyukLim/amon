@@ -13,4 +13,5 @@
 - arch/260518-231929-python-stdlib.md — ADR: Python 3 stdlib only (Go/Bash 미채택)
 - arch/260518-231930-stuck-silent-threshold.md — ADR: Stuck 판정은 단순 silent 임계치 (tool 실행 구분 안 함)
 - arch/260518-231931-codex-multi-jsonl-default.md — ADR: Codex multi-jsonl default = 최신 mtime 1개
-- arch/260518-231932-discovery-noninteractive-only.md — ADR: Discovery 는 non-interactive 세션만 대상
+- arch/260518-231932-discovery-noninteractive-only.md — ADR: Discovery 는 non-interactive 세션만 대상 (superseded)
+- arch/260520-093830-discovery-all-agents-inline-filter.md — ADR: Discovery default = all agent sessions with inline filter

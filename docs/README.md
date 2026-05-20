@@ -1,13 +1,13 @@
 # amon Documentation
 
-**Version**: 2  |  **Last Updated**: 2026-05-19
+**Version**: 3  |  **Last Updated**: 2026-05-20
 
 <!-- atlas-managed: do not delete sections; edit content freely -->
 <!-- atlas-version: 1 -->
 
 ## 1. Project Overview
 
-`amon` is a single-file Python CLI that monitors non-interactive Claude and Codex agent sessions by tailing their JSONL session files. It supports direct tailing with exit reporting, one-shot snapshots with process state, and a no-argument discovery mode that opens one `xpanes` pane per active session.
+`amon` is a single-file Python CLI that monitors Claude and Codex agent sessions by tailing their JSONL session files. It supports direct tailing with exit reporting, one-shot snapshots with process state, a default sessions TUI, and an `xpanes` discovery mode. Discovery includes all agent sessions by default and can be narrowed to inline (non-interactive) sessions with `-i` / `--inline-only`.
 
 The implementation is now present in [`../amon`](../amon), with user-facing usage in [`../README.md`](../README.md), regression tests in [`../tests/test_amon.py`](../tests/test_amon.py), and Claude wrapper setup/cleanup in [`install-claude-session-wrapper.sh`](../scripts/install-claude-session-wrapper.sh) and [`uninstall-claude-session-wrapper.sh`](../scripts/uninstall-claude-session-wrapper.sh).
 
@@ -56,7 +56,7 @@ The implementation is now present in [`../amon`](../amon), with user-facing usag
 
 ## 4. Drift Snapshot
 
-(현재 발견된 어긋남 없음 — sync 기준 2026-05-19)
+(현재 발견된 어긋남 없음 — sync 기준 2026-05-20)
 
 ## 5. Related Documents
 
