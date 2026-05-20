@@ -1,9 +1,8 @@
-import importlib.util
 import json
 import io
-from importlib.machinery import SourceFileLoader
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from unittest import mock
@@ -13,11 +12,22 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures"
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
-loader = SourceFileLoader("amon", str(ROOT / "amon"))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-amon = importlib.util.module_from_spec(spec)
-loader.exec_module(amon)
+import amon
+import amon.agents.claude as claude_agent
+import amon.agents.codex as codex_agent
+import amon.cli as amon_cli
+import amon.host as amon_host
+import amon.modes.sessions as sessions_mode
+import amon.modes.xpane as xpane_mode
+import amon.monitor.snapshot as monitor_snapshot
+import amon.monitor.tail as monitor_tail
+import amon.sessions.discovery as session_discovery
+import amon.sessions.resolve as session_resolve
+import amon.ui.render as ui_render
 
 
 class TestFixtureFiles(unittest.TestCase):
@@ -114,12 +124,145 @@ class TestClaudeSessionWrapperInstaller(unittest.TestCase):
             self.assertEqual(profile.read_text(encoding="utf-8"), "plain\n")
 
 
+class TestInstallUninstallScripts(unittest.TestCase):
+    def test_install_and_uninstall_all_related_files(self):
+        install_script = ROOT / "scripts" / "install.sh"
+        uninstall_script = ROOT / "scripts" / "uninstall.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            profile = Path(tmp) / ".profile"
+
+            install_proc = subprocess.run(
+                [
+                    str(install_script),
+                    "--bin-dir",
+                    str(bin_dir),
+                    "--profile",
+                    str(profile),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(install_proc.returncode, 0, install_proc.stderr)
+
+            target = bin_dir / "amon"
+            self.assertTrue(target.exists())
+            self.assertTrue(os.access(target, os.X_OK))
+            help_proc = subprocess.run(
+                [str(target), "--help"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(help_proc.returncode, 0, help_proc.stderr)
+            self.assertIn("Monitor active Claude and Codex", help_proc.stdout)
+            self.assertIn("# >>> amon claude session wrapper >>>", profile.read_text(encoding="utf-8"))
+
+            uninstall_proc = subprocess.run(
+                [
+                    str(uninstall_script),
+                    "--bin-dir",
+                    str(bin_dir),
+                    "--profile",
+                    str(profile),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(uninstall_proc.returncode, 0, uninstall_proc.stderr)
+            self.assertFalse(target.exists())
+            self.assertNotIn(
+                "# >>> amon claude session wrapper >>>",
+                profile.read_text(encoding="utf-8"),
+            )
+
+    def test_uninstall_refuses_unknown_command_without_force(self):
+        uninstall_script = ROOT / "scripts" / "uninstall.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            target = bin_dir / "amon"
+            target.write_text("#!/usr/bin/env sh\necho not amon\n", encoding="utf-8")
+            target.chmod(0o755)
+
+            proc = subprocess.run(
+                [
+                    str(uninstall_script),
+                    "--bin-dir",
+                    str(bin_dir),
+                    "--no-claude-wrapper",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertTrue(target.exists())
+            self.assertIn("does not look like amon", proc.stderr)
+
+
 class TestSkeleton(unittest.TestCase):
-    def test_imports_extensionless_executable(self):
+    def test_imports_package(self):
         self.assertTrue(hasattr(amon, "main"))
 
+    def test_checkout_shim_help_exits_successfully(self):
+        proc = subprocess.run(
+            [str(ROOT / "amon"), "--help"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("Monitor active Claude and Codex", proc.stdout)
+
+    def test_package_module_help_exits_successfully(self):
+        env = os.environ.copy()
+        env["PYTHONPATH"] = (
+            str(SRC)
+            if not env.get("PYTHONPATH")
+            else str(SRC) + os.pathsep + env["PYTHONPATH"]
+        )
+        proc = subprocess.run(
+            [sys.executable, "-m", "amon", "--help"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("Monitor active Claude and Codex", proc.stdout)
+
+    def test_build_standalone_artifact_runs_help(self):
+        proc = subprocess.run(
+            [str(ROOT / "scripts" / "build-standalone.sh")],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        artifact = Path(proc.stdout.strip())
+        self.assertEqual(artifact, ROOT / "dist" / "amon")
+        help_proc = subprocess.run(
+            [str(artifact), "--help"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(help_proc.returncode, 0)
+        self.assertIn("Monitor active Claude and Codex", help_proc.stdout)
+
     def test_main_accepts_argv(self):
-        with mock.patch.object(amon, "run_sessions_mode", return_value=0):
+        with mock.patch.object(amon_cli, "run_sessions_mode", return_value=0):
             self.assertEqual(amon.main([]), 0)
 
     def test_help_exits_successfully(self):
@@ -137,14 +280,14 @@ class TestSkeleton(unittest.TestCase):
 class TestCliWiring(unittest.TestCase):
     def test_main_missing_session_id_exits_one(self):
         err = io.StringIO()
-        with mock.patch.object(amon, "resolve_path_from_session_id", return_value=None):
+        with mock.patch.object(amon_cli, "resolve_path_from_session_id", return_value=None):
             with mock.patch.object(amon.sys, "stderr", err):
                 code = amon.main(["--session-id", "missing"])
         self.assertEqual(code, 1)
         self.assertIn("session id not found", err.getvalue())
 
     def test_main_session_path_once_calls_snapshot(self):
-        with mock.patch.object(amon, "run_snapshot", return_value=0) as snapshot:
+        with mock.patch.object(amon_cli, "run_snapshot", return_value=0) as snapshot:
             code = amon.main([
                 "--session-path",
                 "/tmp/.codex/sessions/session-123456789.jsonl",
@@ -166,8 +309,8 @@ class TestCliWiring(unittest.TestCase):
             path = Path(tmp) / ".codex" / "sessions" / "session-123456789.jsonl"
             path.parent.mkdir(parents=True)
             path.write_text("{}\n", encoding="utf-8")
-            with mock.patch.object(amon, "resolve_session_pid", return_value=None):
-                with mock.patch.object(amon, "run_snapshot", return_value=4) as snapshot:
+            with mock.patch.object(amon_cli, "resolve_session_pid", return_value=None):
+                with mock.patch.object(amon_cli, "run_snapshot", return_value=4) as snapshot:
                     code = amon.main(["--session-path", str(path), "--once"])
         self.assertEqual(code, 4)
         snapshot.assert_called_once_with(
@@ -184,8 +327,8 @@ class TestCliWiring(unittest.TestCase):
         spec = amon.encode_session_spec(
             {"agent": "claude", "pid": 321, "path": "/tmp/claude-session.jsonl"}
         )
-        with mock.patch.object(amon.Path, "exists", return_value=True):
-            with mock.patch.object(amon, "run_tail", return_value=0) as tail:
+        with mock.patch.object(amon_cli.Path, "exists", return_value=True):
+            with mock.patch.object(amon_cli, "run_tail", return_value=0) as tail:
                 code = amon.main(["--session-spec", spec, "--idle-threshold", "7"])
         self.assertEqual(code, 0)
         tail.assert_called_once_with(
@@ -199,11 +342,11 @@ class TestCliWiring(unittest.TestCase):
 
     def test_main_session_id_opens_detail_with_lines(self):
         with mock.patch.object(
-            amon,
+            amon_cli,
             "resolve_path_from_session_id",
             return_value="/tmp/.codex/sessions/run-abcdef.jsonl",
         ):
-            with mock.patch.object(amon, "run_session_detail_path", return_value=0) as detail:
+            with mock.patch.object(amon_cli, "run_session_detail_path", return_value=0) as detail:
                 code = amon.main(["--session-id", "abcdef", "--lines", "12"])
         self.assertEqual(code, 0)
         detail.assert_called_once_with(
@@ -219,8 +362,8 @@ class TestCliWiring(unittest.TestCase):
             path.parent.mkdir(parents=True)
             path.write_text("{}\n", encoding="utf-8")
             out = io.StringIO()
-            with mock.patch.object(amon, "resolve_session_pid", return_value=None):
-                with mock.patch.object(amon, "run_tail") as tail:
+            with mock.patch.object(amon_cli, "resolve_session_pid", return_value=None):
+                with mock.patch.object(amon_cli, "run_tail") as tail:
                     with mock.patch.object(amon.sys, "stdout", out):
                         code = amon.main(["--session-path", str(path)])
         self.assertEqual(code, 0)
@@ -231,7 +374,7 @@ class TestCliWiring(unittest.TestCase):
         spec = amon.encode_session_spec(
             {"agent": "claude", "pid": 321, "path": "/tmp/claude-session.jsonl"}
         )
-        with mock.patch.object(amon, "run_snapshot", return_value=4) as snapshot:
+        with mock.patch.object(amon_cli, "run_snapshot", return_value=4) as snapshot:
             code = amon.main(["--session-spec", spec, "--once"])
         self.assertEqual(code, 4)
         snapshot.assert_called_once_with(
@@ -262,7 +405,7 @@ class TestCliWiring(unittest.TestCase):
         self.assertEqual(out.getvalue().strip(), "codex/019cb430-debf-70e3-9449-e4cde0120f9c")
 
     def test_main_no_args_calls_sessions_mode(self):
-        with mock.patch.object(amon, "run_sessions_mode", return_value=0) as sessions_mode:
+        with mock.patch.object(amon_cli, "run_sessions_mode", return_value=0) as sessions_mode:
             code = amon.main([])
         self.assertEqual(code, 0)
         sessions_mode.assert_called_once_with(
@@ -275,7 +418,7 @@ class TestCliWiring(unittest.TestCase):
         )
 
     def test_main_current_calls_sessions_mode_current_scope(self):
-        with mock.patch.object(amon, "run_sessions_mode", return_value=0) as sessions_mode:
+        with mock.patch.object(amon_cli, "run_sessions_mode", return_value=0) as sessions_mode:
             code = amon.main(["--current"])
         self.assertEqual(code, 0)
         sessions_mode.assert_called_once_with(
@@ -288,7 +431,7 @@ class TestCliWiring(unittest.TestCase):
         )
 
     def test_main_inline_only_calls_sessions_mode(self):
-        with mock.patch.object(amon, "run_sessions_mode", return_value=0) as sessions_mode:
+        with mock.patch.object(amon_cli, "run_sessions_mode", return_value=0) as sessions_mode:
             code = amon.main(["-i"])
         self.assertEqual(code, 0)
         sessions_mode.assert_called_once_with(
@@ -301,7 +444,7 @@ class TestCliWiring(unittest.TestCase):
         )
 
     def test_main_lines_passes_to_sessions_mode(self):
-        with mock.patch.object(amon, "run_sessions_mode", return_value=0) as sessions_mode:
+        with mock.patch.object(amon_cli, "run_sessions_mode", return_value=0) as sessions_mode:
             code = amon.main(["--lines", "25"])
         self.assertEqual(code, 0)
         sessions_mode.assert_called_once_with(
@@ -320,7 +463,7 @@ class TestCliWiring(unittest.TestCase):
         self.assertEqual(caught.exception.code, 1)
 
     def test_main_xpane_calls_mode_b(self):
-        with mock.patch.object(amon, "run_mode_b", return_value=0) as mode_b:
+        with mock.patch.object(amon_cli, "run_mode_b", return_value=0) as mode_b:
             code = amon.main(["xpane"])
         self.assertEqual(code, 0)
         mode_b.assert_called_once_with(
@@ -332,7 +475,7 @@ class TestCliWiring(unittest.TestCase):
         )
 
     def test_main_xpane_current_calls_mode_b_current_scope(self):
-        with mock.patch.object(amon, "run_mode_b", return_value=0) as mode_b:
+        with mock.patch.object(amon_cli, "run_mode_b", return_value=0) as mode_b:
             code = amon.main(["xpane", "--current"])
         self.assertEqual(code, 0)
         mode_b.assert_called_once_with(
@@ -344,7 +487,7 @@ class TestCliWiring(unittest.TestCase):
         )
 
     def test_main_xpane_inline_only_calls_mode_b(self):
-        with mock.patch.object(amon, "run_mode_b", return_value=0) as mode_b:
+        with mock.patch.object(amon_cli, "run_mode_b", return_value=0) as mode_b:
             code = amon.main(["xpane", "-i"])
         self.assertEqual(code, 0)
         mode_b.assert_called_once_with(
@@ -357,11 +500,11 @@ class TestCliWiring(unittest.TestCase):
 
     def test_main_positional_session_id_opens_detail(self):
         with mock.patch.object(
-            amon,
+            amon_cli,
             "resolve_path_from_session_id",
             return_value="/tmp/.codex/sessions/run-abcdef.jsonl",
         ):
-            with mock.patch.object(amon, "run_session_detail_path", return_value=0) as detail:
+            with mock.patch.object(amon_cli, "run_session_detail_path", return_value=0) as detail:
                 code = amon.main(["abcdef"])
         self.assertEqual(code, 0)
         detail.assert_called_once_with(
@@ -389,7 +532,7 @@ class TestCliWiring(unittest.TestCase):
 
     def test_main_unknown_positional_target_points_to_xpane(self):
         err = io.StringIO()
-        with mock.patch.object(amon, "resolve_path_from_session_id", return_value=None):
+        with mock.patch.object(amon_cli, "resolve_path_from_session_id", return_value=None):
             with mock.patch.object(amon.sys, "stderr", err):
                 code = amon.main(["legacy-arg"])
         self.assertEqual(code, 1)
@@ -398,7 +541,7 @@ class TestCliWiring(unittest.TestCase):
 
     def test_main_unknown_positional_targets_point_to_xpane(self):
         err = io.StringIO()
-        with mock.patch.object(amon, "resolve_path_from_session_id") as resolve:
+        with mock.patch.object(amon_cli, "resolve_path_from_session_id") as resolve:
             with mock.patch.object(amon.sys, "stderr", err):
                 code = amon.main(["foo", "bar"])
         self.assertEqual(code, 1)
@@ -409,13 +552,13 @@ class TestCliWiring(unittest.TestCase):
 
     def test_main_session_id_resolves_and_uses_snapshot_when_once(self):
         with mock.patch.object(
-            amon,
+            amon_cli,
             "resolve_path_from_session_id",
             return_value="/tmp/.codex/sessions/run-abcdef.jsonl",
         ):
-            with mock.patch.object(amon.Path, "exists", return_value=True):
-                with mock.patch.object(amon, "resolve_session_pid", return_value=555):
-                    with mock.patch.object(amon, "run_snapshot", return_value=2) as snapshot:
+            with mock.patch.object(amon_cli.Path, "exists", return_value=True):
+                with mock.patch.object(amon_cli, "resolve_session_pid", return_value=555):
+                    with mock.patch.object(amon_cli, "run_snapshot", return_value=2) as snapshot:
                         code = amon.main([
                             "--session-id",
                             "abcdef",
@@ -436,11 +579,11 @@ class TestCliWiring(unittest.TestCase):
 
     def test_main_session_id_detail_uses_requested_color(self):
         with mock.patch.object(
-            amon,
+            amon_cli,
             "resolve_path_from_session_id",
             return_value="/tmp/.codex/sessions/run-abcdef.jsonl",
         ):
-            with mock.patch.object(amon, "run_session_detail_path", return_value=0) as detail:
+            with mock.patch.object(amon_cli, "run_session_detail_path", return_value=0) as detail:
                 code = amon.main(["--session-id", "abcdef", "--color", "always"])
         self.assertEqual(code, 0)
         detail.assert_called_once_with(
@@ -470,7 +613,7 @@ class TestPathAndSessionResolution(unittest.TestCase):
             "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
             "python 123 user cwd DIR 1,4 128 999 /tmp/path with spaces\n"
         )
-        with mock.patch.object(amon, "_run_lsof", return_value=output):
+        with mock.patch.object(amon_host, "_run_lsof", return_value=output):
             self.assertEqual(amon.process_cwd(123), "/tmp/path with spaces")
 
     def test_pick_latest_jsonl_and_empty_directory(self):
@@ -496,7 +639,7 @@ class TestPathAndSessionResolution(unittest.TestCase):
                 "python 123 user cwd DIR 1,4 128 999 /tmp/path with spaces\n"
             )
             with mock.patch.object(amon.Path, "home", return_value=Path(home)):
-                with mock.patch.object(amon, "_run_lsof", return_value=lsof):
+                with mock.patch.object(amon_host, "_run_lsof", return_value=lsof):
                     self.assertEqual(amon.resolve_claude_session_path(123), str(session))
 
     def test_resolve_claude_session_path_prefers_cmdline_session_id(self):
@@ -518,7 +661,7 @@ class TestPathAndSessionResolution(unittest.TestCase):
                 "-p hello"
             )
             with mock.patch.object(amon.Path, "home", return_value=Path(home)):
-                with mock.patch.object(amon, "_run_lsof", return_value=lsof):
+                with mock.patch.object(amon_host, "_run_lsof", return_value=lsof):
                     self.assertEqual(
                         amon.resolve_claude_session_path(123, cmdline=cmdline),
                         str(selected),
@@ -535,7 +678,7 @@ class TestPathAndSessionResolution(unittest.TestCase):
                 "python 123 user cwd DIR 1,4 128 999 /tmp/path\n"
             )
             with mock.patch.object(amon.Path, "home", return_value=Path(home)):
-                with mock.patch.object(amon, "_run_lsof", return_value=lsof):
+                with mock.patch.object(amon_host, "_run_lsof", return_value=lsof):
                     self.assertIsNone(
                         amon.resolve_claude_session_path(
                             123,
@@ -590,7 +733,7 @@ class TestPathAndSessionResolution(unittest.TestCase):
                     f"codex 12 user 5r REG 1,4 10 3 {moved_new}",
                 ]
             )
-            with mock.patch.object(amon, "_run_lsof", return_value=lsof):
+            with mock.patch.object(codex_agent, "_run_lsof", return_value=lsof):
                 self.assertEqual(amon.resolve_codex_session_paths(12), [str(moved_new)])
                 self.assertEqual(
                     amon.resolve_codex_session_paths(12, all_sessions=True),
@@ -832,7 +975,7 @@ class TestRunTail(unittest.TestCase):
             path = Path(tmp) / "session.jsonl"
             path.write_text("", encoding="utf-8")
             out = io.StringIO()
-            with mock.patch.object(amon, "_pid_alive", return_value=False):
+            with mock.patch.object(monitor_tail, "_pid_alive", return_value=False):
                 code = amon.run_tail(
                     str(path),
                     "claude",
@@ -1191,7 +1334,7 @@ class TestSessionDetail(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_codex_log(tmp, "session.jsonl", ["finished without marker"])
             out = io.StringIO()
-            with mock.patch.object(amon, "resolve_active_session_record", return_value=None):
+            with mock.patch.object(sessions_mode, "resolve_active_session_record", return_value=None):
                 code = amon.run_session_detail_path(
                     str(path),
                     "codex",
@@ -1249,7 +1392,7 @@ class TestSnapshot(unittest.TestCase):
             path = Path(tmp) / "session.jsonl"
             path.write_text((FIXTURES / "codex_session.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
             os.utime(path, (900, 900))
-            with mock.patch.object(amon, "_pid_alive", return_value=True):
+            with mock.patch.object(monitor_snapshot, "_process_state", return_value="alive"):
                 code, line = amon.snapshot_status(
                     str(path),
                     "codex",
@@ -1266,7 +1409,7 @@ class TestSnapshot(unittest.TestCase):
             path = Path(tmp) / "session.jsonl"
             path.write_text((FIXTURES / "codex_session.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
             os.utime(path, (999, 999))
-            with mock.patch.object(amon, "_pid_alive", return_value=False):
+            with mock.patch.object(monitor_snapshot, "_process_state", return_value="exited"):
                 code, line = amon.snapshot_status(
                     str(path),
                     "codex",
@@ -1380,7 +1523,7 @@ class TestDiscovery(unittest.TestCase):
         def fake_run(args, **_kwargs):
             return mock.Mock(stdout=outputs[tuple(args)])
 
-        with mock.patch.object(amon.subprocess, "run", side_effect=fake_run):
+        with mock.patch.object(amon_host.subprocess, "run", side_effect=fake_run):
             self.assertEqual(amon.candidate_pids(["claude", "codex"]), [10, 11, 12])
 
     def test_process_command_uses_ps_command(self):
@@ -1388,7 +1531,7 @@ class TestDiscovery(unittest.TestCase):
             self.assertEqual(args, ["ps", "-o", "command=", "-p", "123"])
             return mock.Mock(stdout="/opt/bin/claude -p hello\n")
 
-        with mock.patch.object(amon.subprocess, "run", side_effect=fake_run):
+        with mock.patch.object(amon_host.subprocess, "run", side_effect=fake_run):
             self.assertEqual(amon.process_command(123), "/opt/bin/claude -p hello")
 
     def test_claude_noninteractive_accepts_print_flags(self):
@@ -1453,16 +1596,16 @@ class TestDiscovery(unittest.TestCase):
             3: ["/tmp/codex-a.jsonl", "/tmp/codex-b.jsonl"],
             5: ["/tmp/codex-interactive.jsonl"],
         }
-        with mock.patch.object(amon, "candidate_pids", return_value=[1, 2, 3, 4, 5]):
-            with mock.patch.object(amon, "process_command", side_effect=lambda pid: commands[pid]):
-                with mock.patch.object(amon, "process_cwd", side_effect=lambda pid: cwds[pid]):
+        with mock.patch.object(session_discovery, "candidate_pids", return_value=[1, 2, 3, 4, 5]):
+            with mock.patch.object(session_discovery, "process_command", side_effect=lambda pid: commands[pid]):
+                with mock.patch.object(session_discovery, "process_cwd", side_effect=lambda pid: cwds[pid]):
                     with mock.patch.object(
-                        amon,
+                        claude_agent,
                         "resolve_claude_session_path",
                         side_effect=lambda pid, **_kwargs: claude_paths[pid],
                     ) as claude_resolver:
                         with mock.patch.object(
-                            amon,
+                            codex_agent,
                             "resolve_codex_session_paths",
                             side_effect=lambda pid, all_sessions=False: codex_paths[pid],
                         ) as codex_resolver:
@@ -1540,16 +1683,16 @@ class TestDiscovery(unittest.TestCase):
             3: "/repo/codex",
             4: "/repo/codex-interactive",
         }
-        with mock.patch.object(amon, "candidate_pids", return_value=[1, 2, 3, 4]):
-            with mock.patch.object(amon, "process_command", side_effect=lambda pid: commands[pid]):
-                with mock.patch.object(amon, "process_cwd", side_effect=lambda pid: cwds[pid]):
+        with mock.patch.object(session_discovery, "candidate_pids", return_value=[1, 2, 3, 4]):
+            with mock.patch.object(session_discovery, "process_command", side_effect=lambda pid: commands[pid]):
+                with mock.patch.object(session_discovery, "process_cwd", side_effect=lambda pid: cwds[pid]):
                     with mock.patch.object(
-                        amon,
+                        claude_agent,
                         "resolve_claude_session_path",
                         return_value="/tmp/claude.jsonl",
                     ) as claude_resolver:
                         with mock.patch.object(
-                            amon,
+                            codex_agent,
                             "resolve_codex_session_paths",
                             return_value=["/tmp/codex.jsonl"],
                         ) as codex_resolver:
@@ -1594,11 +1737,11 @@ class TestDiscovery(unittest.TestCase):
             cwds = {1: "/workspace/team-a/api", 2: "/workspace/team-b/api"}
             paths = {1: [str(alpha)], 2: [str(beta)]}
 
-            with mock.patch.object(amon, "candidate_pids", return_value=[1, 2]):
-                with mock.patch.object(amon, "process_command", side_effect=lambda pid: commands[pid]):
-                    with mock.patch.object(amon, "process_cwd", side_effect=lambda pid: cwds[pid]):
+            with mock.patch.object(session_discovery, "candidate_pids", return_value=[1, 2]):
+                with mock.patch.object(session_discovery, "process_command", side_effect=lambda pid: commands[pid]):
+                    with mock.patch.object(session_discovery, "process_cwd", side_effect=lambda pid: cwds[pid]):
                         with mock.patch.object(
-                            amon,
+                            codex_agent,
                             "resolve_codex_session_paths",
                             side_effect=lambda pid, all_sessions=False: paths[pid],
                         ):
@@ -1628,16 +1771,16 @@ class TestDiscovery(unittest.TestCase):
             3: "/other",
             4: "/repo/ignored",
         }
-        with mock.patch.object(amon, "candidate_pids", return_value=[1, 2, 3, 4]):
-            with mock.patch.object(amon, "process_command", side_effect=lambda pid: commands[pid]):
-                with mock.patch.object(amon, "process_cwd", side_effect=lambda pid: cwds[pid]):
+        with mock.patch.object(session_discovery, "candidate_pids", return_value=[1, 2, 3, 4]):
+            with mock.patch.object(session_discovery, "process_command", side_effect=lambda pid: commands[pid]):
+                with mock.patch.object(session_discovery, "process_cwd", side_effect=lambda pid: cwds[pid]):
                     with mock.patch.object(
-                        amon,
+                        claude_agent,
                         "resolve_claude_session_path",
                         return_value="/tmp/claude.jsonl",
                     ) as claude_resolver:
                         with mock.patch.object(
-                            amon,
+                            codex_agent,
                             "resolve_codex_session_paths",
                             return_value=["/tmp/codex.jsonl"],
                         ) as codex_resolver:
@@ -1685,12 +1828,12 @@ class TestDiscovery(unittest.TestCase):
                 {"agent": "codex", "pid": 222, "path": str(other)},
                 {"agent": "codex", "pid": 333, "path": str(target)},
             ]
-            with mock.patch.object(amon, "discover_active_sessions", return_value=sessions) as discover:
+            with mock.patch.object(session_discovery, "discover_active_sessions", return_value=sessions) as discover:
                 self.assertEqual(amon.resolve_session_pid(str(target), "codex"), 333)
         discover.assert_called_once_with(codex_all=True)
 
     def test_resolve_session_pid_returns_none_without_live_match(self):
-        with mock.patch.object(amon, "discover_active_sessions", return_value=[]):
+        with mock.patch.object(session_discovery, "discover_active_sessions", return_value=[]):
             self.assertIsNone(amon.resolve_session_pid("/tmp/session.jsonl", "codex"))
 
 
@@ -2534,7 +2677,7 @@ class TestSessionListState(unittest.TestCase):
         for icon in amon.ASCII_STATIC_STATUS_ICONS.values():
             self.assertEqual(amon._display_width(icon), 1)
 
-        with mock.patch.object(amon, "_display_width", return_value=2):
+        with mock.patch.object(ui_render, "_display_width", return_value=2):
             self.assertEqual(amon._status_icon("running", 0.0, unicode_icons=True), ".")
             self.assertEqual(amon._static_status_icon("running", unicode_icons=True), "*")
 
@@ -2778,15 +2921,15 @@ class TestModeBLauncher(unittest.TestCase):
 
     def test_run_mode_b_missing_xpanes_exits_three(self):
         err = io.StringIO()
-        with mock.patch.object(amon.shutil, "which", return_value=None):
+        with mock.patch.object(xpane_mode.shutil, "which", return_value=None):
             code = amon.run_mode_b(30, codex_all=False, error=err)
         self.assertEqual(code, 3)
         self.assertIn("xpanes", err.getvalue())
 
     def test_run_mode_b_no_sessions_exits_zero(self):
         err = io.StringIO()
-        with mock.patch.object(amon.shutil, "which", return_value="/opt/homebrew/bin/xpanes"):
-            with mock.patch.object(amon, "discover_active_sessions", return_value=[]) as discover:
+        with mock.patch.object(xpane_mode.shutil, "which", return_value="/opt/homebrew/bin/xpanes"):
+            with mock.patch.object(session_discovery, "discover_active_sessions", return_value=[]) as discover:
                 code = amon.run_mode_b(30, codex_all=False, error=err)
         self.assertEqual(code, 0)
         self.assertIn("no active", err.getvalue())
@@ -2799,8 +2942,8 @@ class TestModeBLauncher(unittest.TestCase):
 
     def test_run_mode_b_current_scope_passes_scope_to_discovery(self):
         err = io.StringIO()
-        with mock.patch.object(amon.shutil, "which", return_value="/opt/homebrew/bin/xpanes"):
-            with mock.patch.object(amon, "discover_active_sessions", return_value=[]) as discover:
+        with mock.patch.object(xpane_mode.shutil, "which", return_value="/opt/homebrew/bin/xpanes"):
+            with mock.patch.object(session_discovery, "discover_active_sessions", return_value=[]) as discover:
                 code = amon.run_mode_b(
                     30,
                     codex_all=True,
@@ -2818,8 +2961,8 @@ class TestModeBLauncher(unittest.TestCase):
 
     def test_run_mode_b_inline_only_passes_filter_to_discovery(self):
         err = io.StringIO()
-        with mock.patch.object(amon.shutil, "which", return_value="/opt/homebrew/bin/xpanes"):
-            with mock.patch.object(amon, "discover_active_sessions", return_value=[]) as discover:
+        with mock.patch.object(xpane_mode.shutil, "which", return_value="/opt/homebrew/bin/xpanes"):
+            with mock.patch.object(session_discovery, "discover_active_sessions", return_value=[]) as discover:
                 code = amon.run_mode_b(30, codex_all=False, inline_only=True, error=err)
         self.assertEqual(code, 0)
         self.assertIn("no active inline agent sessions", err.getvalue())
@@ -2838,9 +2981,9 @@ class TestModeBLauncher(unittest.TestCase):
             captured["args"] = args
             return mock.Mock(returncode=0)
 
-        with mock.patch.object(amon.shutil, "which", return_value="/opt/homebrew/bin/xpanes"):
-            with mock.patch.object(amon, "discover_active_sessions", return_value=[session]):
-                with mock.patch.object(amon.subprocess, "run", side_effect=fake_run):
+        with mock.patch.object(xpane_mode.shutil, "which", return_value="/opt/homebrew/bin/xpanes"):
+            with mock.patch.object(session_discovery, "discover_active_sessions", return_value=[session]):
+                with mock.patch.object(amon_host.subprocess, "run", side_effect=fake_run):
                     code = amon.run_mode_b(45, codex_all=True)
         self.assertEqual(code, 0)
         args = captured["args"]
@@ -2862,13 +3005,13 @@ class TestModeBLauncher(unittest.TestCase):
             captured["args"] = args
             return mock.Mock(returncode=0)
 
-        with mock.patch.object(amon.shutil, "which", return_value="/opt/homebrew/bin/xpanes"):
+        with mock.patch.object(xpane_mode.shutil, "which", return_value="/opt/homebrew/bin/xpanes"):
             with mock.patch.object(
-                amon,
+                session_discovery,
                 "discover_active_sessions",
                 return_value=[{"agent": "codex", "pid": 123, "path": "/tmp/session.jsonl"}],
             ):
-                with mock.patch.object(amon.subprocess, "run", side_effect=fake_run):
+                with mock.patch.object(amon_host.subprocess, "run", side_effect=fake_run):
                     code = amon.run_mode_b(0.5, codex_all=False)
         self.assertEqual(code, 0)
         self.assertIn("--idle-threshold 0.5", captured["args"][3])

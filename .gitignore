@@ -1,4 +1,6 @@
 .cairn/
 .claude/state/
 .worktrees/
+.build/
+dist/
 __pycache__/
