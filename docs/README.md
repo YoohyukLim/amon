@@ -7,15 +7,15 @@
 
 ## 1. Project Overview
 
-`amon` is a single-file Python CLI that monitors Claude and Codex agent sessions by tailing their JSONL session files. It supports direct tailing with exit reporting, one-shot snapshots with process state, a default sessions TUI, and an `xpanes` discovery mode. Discovery includes all agent sessions by default and can be narrowed to inline (non-interactive) sessions with `-i` / `--inline-only`.
+`amon` is a Python standard-library CLI that monitors local Claude and Codex agent sessions by discovering running processes, resolving their JSONL session logs, and showing compact list/detail, snapshot, tail, and `xpanes` views. The public command remains `amon`, while the implementation is split into package modules under [`../src/amon`](../src/amon).
 
-The implementation is now present in [`../amon`](../amon), with user-facing usage in [`../README.md`](../README.md), regression tests in [`../tests/test_amon.py`](../tests/test_amon.py), and Claude wrapper setup/cleanup in [`install-claude-session-wrapper.sh`](../scripts/install-claude-session-wrapper.sh) and [`uninstall-claude-session-wrapper.sh`](../scripts/uninstall-claude-session-wrapper.sh).
+The checkout shim is [`../amon`](../amon), user-facing usage and install notes live in [`../README.md`](../README.md), regression tests live in [`../tests/test_amon.py`](../tests/test_amon.py), and operational install/build scripts live in [`../scripts`](../scripts).
 
 ## 2. Documentation Index
 
 | Document | Purpose |
 |---|---|
-| [system/architecture.md](./system/architecture.md) | Current atlas map of the implemented amon CLI, session resolution, lifecycle checks, xpanes launcher, wrapper scripts, and tests |
+| [system/architecture.md](./system/architecture.md) | Current atlas map of the package-based amon CLI, adapter registry, session discovery/resolution, monitor runtime, terminal UI, xpanes launcher, install scripts, and tests |
 
 ## 3. Reading Routes
 
@@ -37,22 +37,22 @@ The implementation is now present in [`../amon`](../amon), with user-facing usag
 
 1. [system/architecture.md](./system/architecture.md) for current responsibilities and dependency direction.
 2. [arch ADRs](./arch/) for constraints that still shape the design.
-3. [`../amon`](../amon) for the single-file implementation.
-4. [`../scripts/install-claude-session-wrapper.sh`](../scripts/install-claude-session-wrapper.sh) and [`../scripts/uninstall-claude-session-wrapper.sh`](../scripts/uninstall-claude-session-wrapper.sh) for shell profile behavior.
+3. [`../src/amon`](../src/amon) for the package implementation.
+4. [`../scripts/install.sh`](../scripts/install.sh), [`../scripts/uninstall.sh`](../scripts/uninstall.sh), [`../scripts/install-claude-session-wrapper.sh`](../scripts/install-claude-session-wrapper.sh), and [`../scripts/uninstall-claude-session-wrapper.sh`](../scripts/uninstall-claude-session-wrapper.sh) for shell profile behavior.
 
 ### 3.4 Reading codebase for the first time
 
 1. [`../README.md`](../README.md) for install and CLI usage.
 2. [system/architecture.md](./system/architecture.md) for the implemented architecture.
-3. [`../amon`](../amon) for runtime code.
+3. [`../src/amon/cli.py`](../src/amon/cli.py) for mode dispatch.
 4. [`../tests/test_amon.py`](../tests/test_amon.py) for behavior examples and edge cases.
 
 ### 3.5 Operations / Deployment
 
-1. [`../README.md`](../README.md) install section for copy/symlink usage.
-2. [system/architecture.md](./system/architecture.md) integration points for host command, process liveness, and `xpanes` dependencies.
+1. [`../README.md`](../README.md) install section for build, copy, and source-symlink usage.
+2. [system/architecture.md](./system/architecture.md) integration points for host commands, process liveness, terminal UI, `xpanes`, and install scripts.
 3. [Python stdlib ADR](./arch/260518-231929-python-stdlib.md) for dependency policy.
-4. Shell wrapper scripts when Claude process discoverability needs explicit session ids.
+4. [`../scripts/build-standalone.sh`](../scripts/build-standalone.sh), [`../scripts/install.sh`](../scripts/install.sh), and [`../scripts/uninstall.sh`](../scripts/uninstall.sh) for operational commands.
 
 ## 4. Drift Snapshot
 
@@ -67,3 +67,4 @@ The implementation is now present in [`../amon`](../amon), with user-facing usag
 - [Initial implementation task](./tasks/260518-231933-amon-implementation.md)
 - [Implementation v2 task](./tasks/260519-090729-amon-implementation-v2.md)
 - [Implementation checklist](./tasks/260519-091951-amon-implementation-checklist.md)
+- [Sessions mode checklist](./tasks/260519-211154-sessions-mode-checklist.md)
