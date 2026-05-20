@@ -38,14 +38,14 @@ def build_parser() -> argparse.ArgumentParser:
             "  amon                         list active agent sessions\n"
             "  amon --current               list sessions under the current cwd\n"
             "  amon -i                      list inline (non-interactive) sessions\n"
-            "  amon xpane                   open the existing xpanes view\n"
-            "  amon xpane -i                open xpanes for inline sessions\n"
-            "  amon xpane --current         open xpanes for sessions under the current cwd\n"
+            "  amon xpanes                  open the existing xpanes view\n"
+            "  amon xpanes -i               open xpanes for inline sessions\n"
+            "  amon xpanes --current        open xpanes for sessions under the current cwd\n"
             "  amon ID                      open one resolved session detail view"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("targets", nargs="*", help="session id to monitor, or 'xpane'")
+    parser.add_argument("targets", nargs="*", help="session id to monitor, or 'xpanes'")
     parser.add_argument(
         "--current",
         action="store_true",
@@ -100,7 +100,7 @@ def _scope_from_args(args) -> str:
 def _print_unknown_target_error(target: str, error=None) -> None:
     err = error or sys.stderr
     print(f"amon: unknown session id or mode: {target}", file=err)
-    print("amon: use 'amon xpane ...' for the existing xpanes pane mode", file=err)
+    print("amon: use 'amon xpanes ...' for the existing xpanes pane mode", file=err)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -114,7 +114,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.inline_only:
         if _direct_session_args(args):
             parser.error("--inline-only cannot be combined with direct session options")
-        if targets and not (len(targets) == 1 and targets[0] == "xpane"):
+        if targets and not (len(targets) == 1 and targets[0] == "xpanes"):
             parser.error("--inline-only cannot be used with session id mode")
 
     if args.session_title:
@@ -125,7 +125,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 1
         return 0
 
-    if len(targets) == 1 and targets[0] == "xpane":
+    if len(targets) == 1 and targets[0] == "xpanes":
         return run_mode_b(
             args.idle_threshold,
             codex_all=args.codex_all_sessions,

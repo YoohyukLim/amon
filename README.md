@@ -36,7 +36,7 @@ opens the sessions TUI for any active Claude or Codex agent sessions. See
 
 - Python 3
 - Standard host tools used for discovery: `pgrep`, `ps`, and `lsof`
-- Optional: `xpanes` for `amon xpane`
+- Optional: `xpanes` for `amon xpanes`
 
 No third-party Python package is required.
 
@@ -250,12 +250,12 @@ amon --lines 500 <session-id>
 Open one pane per discovered session with `xpanes`:
 
 ```bash
-amon xpane
-amon xpane --current
-amon xpane -i
+amon xpanes
+amon xpanes --current
+amon xpanes -i
 ```
 
-`amon xpane` discovers sessions once when it starts. Re-run it to build a new
+`amon xpanes` discovers sessions once when it starts. Re-run it to build a new
 pane layout after additional agents start.
 
 Print one status line and exit:
@@ -288,7 +288,7 @@ is always plain text.
   tail ended.
 - `1`: invalid input, unresolved session id, or missing direct session path.
 - `2`: snapshot status is idle.
-- `3`: `xpanes` is required but unavailable for `amon xpane`.
+- `3`: `xpanes` is required but unavailable for `amon xpanes`.
 - `4`: snapshot status is exited because the session process is no longer
   alive.
 

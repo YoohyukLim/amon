@@ -82,7 +82,7 @@ The core architectural constraint remains that a live monitor instance owns exac
 
 ### 5.3 Xpanes Launch
 
-1. User runs `amon xpane`, `amon xpane --current`, or `amon xpane -i`.
+1. User runs `amon xpanes`, `amon xpanes --current`, or `amon xpanes -i`.
 2. [`src/amon/modes/xpane.py`](../../src/amon/modes/xpane.py) verifies `xpanes`, discovers sessions once, and base64-url encodes `{agent,pid,path}` specs through [`src/amon/sessions/resolve.py`](../../src/amon/sessions/resolve.py).
 3. The xpanes command template sets each pane title by calling `amon --session-title {spec}`.
 4. Each pane runs the same command entrypoint with `--session-spec`, `--idle-threshold`, and forced color, so every pane owns a single session stream.
@@ -99,7 +99,7 @@ The core architectural constraint remains that a live monitor instance owns exac
 | Surface | Meaning | Default |
 |---|---|---|
 | `amon` | Open the default sessions TUI/list output | sessions mode |
-| `amon xpane` | Open one xpanes pane per discovered session | requires `xpanes` |
+| `amon xpanes` | Open one xpanes pane per discovered session | requires `xpanes` |
 | Positional `<session-id>` | Resolve a Claude or Codex id and open one detail view | unset |
 | `--current` | Limit discovery modes to processes whose cwd is under the current directory | false |
 | `--session-id` | Resolve one known Claude or Codex session id | unset |

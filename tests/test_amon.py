@@ -474,9 +474,9 @@ class TestCliWiring(unittest.TestCase):
                 amon.main(["--lines", "0"])
         self.assertEqual(caught.exception.code, 1)
 
-    def test_main_xpane_calls_mode_b(self):
+    def test_main_xpanes_calls_mode_b(self):
         with mock.patch.object(amon_cli, "run_mode_b", return_value=0) as mode_b:
-            code = amon.main(["xpane"])
+            code = amon.main(["xpanes"])
         self.assertEqual(code, 0)
         mode_b.assert_called_once_with(
             60.0,
@@ -486,9 +486,9 @@ class TestCliWiring(unittest.TestCase):
             inline_only=False,
         )
 
-    def test_main_xpane_current_calls_mode_b_current_scope(self):
+    def test_main_xpanes_current_calls_mode_b_current_scope(self):
         with mock.patch.object(amon_cli, "run_mode_b", return_value=0) as mode_b:
-            code = amon.main(["xpane", "--current"])
+            code = amon.main(["xpanes", "--current"])
         self.assertEqual(code, 0)
         mode_b.assert_called_once_with(
             60.0,
@@ -498,9 +498,9 @@ class TestCliWiring(unittest.TestCase):
             inline_only=False,
         )
 
-    def test_main_xpane_inline_only_calls_mode_b(self):
+    def test_main_xpanes_inline_only_calls_mode_b(self):
         with mock.patch.object(amon_cli, "run_mode_b", return_value=0) as mode_b:
-            code = amon.main(["xpane", "-i"])
+            code = amon.main(["xpanes", "-i"])
         self.assertEqual(code, 0)
         mode_b.assert_called_once_with(
             60.0,
@@ -542,16 +542,16 @@ class TestCliWiring(unittest.TestCase):
         self.assertEqual(caught.exception.code, 1)
         self.assertIn("--inline-only cannot be combined with direct session options", err.getvalue())
 
-    def test_main_unknown_positional_target_points_to_xpane(self):
+    def test_main_unknown_positional_target_points_to_xpanes(self):
         err = io.StringIO()
         with mock.patch.object(amon_cli, "resolve_path_from_session_id", return_value=None):
             with mock.patch.object(amon.sys, "stderr", err):
                 code = amon.main(["legacy-arg"])
         self.assertEqual(code, 1)
         self.assertIn("unknown session id or mode: legacy-arg", err.getvalue())
-        self.assertIn("amon xpane", err.getvalue())
+        self.assertIn("amon xpanes", err.getvalue())
 
-    def test_main_unknown_positional_targets_point_to_xpane(self):
+    def test_main_unknown_positional_targets_point_to_xpanes(self):
         err = io.StringIO()
         with mock.patch.object(amon_cli, "resolve_path_from_session_id") as resolve:
             with mock.patch.object(amon.sys, "stderr", err):
@@ -559,7 +559,7 @@ class TestCliWiring(unittest.TestCase):
         self.assertEqual(code, 1)
         resolve.assert_not_called()
         self.assertIn("unknown session id or mode: foo bar", err.getvalue())
-        self.assertIn("amon xpane", err.getvalue())
+        self.assertIn("amon xpanes", err.getvalue())
         self.assertNotIn("unrecognized arguments", err.getvalue())
 
     def test_main_session_id_resolves_and_uses_snapshot_when_once(self):
