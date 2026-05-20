@@ -1,5 +1,9 @@
 # amon
 
+<p align="center">
+  <img src="docs/assets/amon.png" alt="Amon - Your Coding Companion" width="720">
+</p>
+
 `amon` monitors local Claude and Codex agent sessions by discovering their
 running processes, resolving their JSONL session logs, and showing compact
 status/detail views.
